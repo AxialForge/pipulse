@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Tag matches VERSION
+        run: |
+          test "v$(cat VERSION)" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != VERSION $(cat VERSION)"; exit 1; }
+      - name: Tests
+        run: python -m unittest discover tests
+      - name: Package
+        run: python tools/package.py --repo "$GITHUB_REPOSITORY"
+      - name: Release notes from CHANGELOG
+        run: |
+          awk -v v="$(cat VERSION)" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## Install the hub on a Raspberry Pi
+
+          \`\`\`
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install-hub.sh | sudo sh
+          \`\`\`
+
+          Then open the address it prints, create a password, and add more Pis from **+ Add a Pi**.
+          EOF
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "PiPulse $GITHUB_REF_NAME" --notes-file notes.md

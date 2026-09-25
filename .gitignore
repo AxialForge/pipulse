@@ -1,0 +1,4 @@
+hub/data/
+dist/
+__pycache__/
+*.tmp.sh
