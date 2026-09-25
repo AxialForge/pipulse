@@ -14,8 +14,10 @@
     <a href="#pis" data-view="pis">Pis</a>
     <a href="#events" data-view="events">Events</a>
     <a href="#settings" data-view="settings">Settings</a>
+    <a href="#about" data-view="about">About</a>
   </nav>
   <div id="totals"></div>
+  <a id="updBanner" class="updBanner" href="#about" hidden></a>
   <button id="addBtn" class="btn">+ Add a Pi</button>
   <button id="logoutBtn" class="btn ghost" title="Sign out">Sign out</button>
 </header>
@@ -33,6 +35,7 @@
 
 <!-- Pis -->
 <section id="view-pis" class="view">
+  <div id="fleetBar" class="fleetBar" hidden></div>
   <main id="grid"></main>
   <div id="empty" hidden>
     <h2>No Pis yet</h2>
@@ -57,6 +60,19 @@
   <button id="evMore" class="btn ghost" hidden>Load older</button>
 </section>
 
+<!-- About -->
+<section id="view-about" class="view page" hidden>
+  <div class="aboutHead">
+    <svg viewBox="0 0 16 16" width="44" height="44"><path d="M1 9h3l2-5 3 9 2-4h4" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+    <div><h2>PiPulse</h2><div class="muted">A hub and clients for keeping an eye on your Raspberry Pis, and keeping any one program from starving them.</div></div>
+  </div>
+  <div class="grid2">
+    <div class="box" id="updBox"></div>
+    <div class="box" id="hubBox"></div>
+  </div>
+  <div class="box" style="margin-top:16px"><h3>What's new</h3><div id="changelog" class="md"></div></div>
+</section>
+
 <!-- Settings -->
 <section id="view-settings" class="view page" hidden>
   <h2>Settings</h2>
@@ -76,7 +92,8 @@
       </form>
       <p class="muted small">Changing it signs out every other browser.</p>
     </div>
-    <div class="box" id="aboutBox"></div>
+    <div class="box wideBox" id="nasBox"></div>
+    <div class="box wideBox" id="guardBox"></div>
     <div class="box">
       <h3>Notifications</h3>
       <p class="muted">Alerts appear on the dashboard and in Events for now. Phone push (ntfy), Home Assistant and email are next.</p>
@@ -84,13 +101,29 @@
   </div>
 </section>
 
-<dialog id="addDlg">
+<dialog id="addDlg" class="mid">
   <h2>Add a Pi</h2>
-  <p>SSH into the new Pi and run:</p>
-  <pre class="cmd"></pre>
-  <button class="btn" data-copy>Copy</button>
+  <nav class="tabs addTabs">
+    <button data-addtab="pi" class="on">Paste on the Pi</button>
+    <button data-addtab="ssh">From your PC over SSH</button>
+  </nav>
+  <div data-addpane="pi">
+    <p>Open a terminal on the new Pi (or SSH into it) and paste:</p>
+    <pre class="cmd" id="addCmd"></pre>
+    <button class="btn" data-copy="addCmd">Copy</button>
+  </div>
+  <div data-addpane="ssh" hidden>
+    <p>Run these from your PC's terminal (PowerShell or Command Prompt on Windows). Each line SSHes into one Pi and installs the client. It asks for that Pi's password when <code>sudo</code> needs it.</p>
+    <div class="row wrap">
+      <label class="inline">SSH user <input id="sshUser" value="pi" size="10"></label>
+      <label class="inline grow">Pi addresses (one per line, or separated by spaces)
+        <textarea id="sshHosts" rows="3" placeholder="192.168.1.210&#10;192.168.1.211"></textarea></label>
+    </div>
+    <pre class="cmd" id="sshCmd"></pre>
+    <button class="btn" data-copy="sshCmd">Copy</button>
+  </div>
   <p class="muted">This installs PiPulse Client, pinned to this hub's certificate. The Pi needs to reach this hub on ports <span class="ports"></span>. It shows up here within about 10 seconds.
-  To remove it later: <code>curl -fsSL <span class="hubUrl"></span>/client/uninstall.sh | sudo sh</code></p>
+  Afterwards, <code>sudo pipulse</code> on that Pi opens its menu. To remove it: <code>curl -fsSL <span class="hubUrl"></span>/client/uninstall.sh | sudo sh</code></p>
   <form method="dialog"><button class="btn ghost">Close</button></form>
 </dialog>
 
@@ -105,7 +138,7 @@
     <button class="btn ghost danger" id="forgetBtn">Forget</button>
     <form method="dialog"><button class="btn ghost" autofocus>✕</button></form>
   </div>
-  <nav class="tabs">
+  <nav class="tabs" id="nodeTabs">
     <button data-tab="overview" class="on">Overview</button>
     <button data-tab="history">History</button>
     <button data-tab="services">Services</button>

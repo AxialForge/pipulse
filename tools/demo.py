@@ -43,8 +43,21 @@ def fake(i):
     results, t0 = [], time.time()
     version = "0.2.0" if i == 1 else VERSION  # one outdated client, to exercise Update
     link = client.Link(HUB, 8751, TOKEN, PIN)
+    boot, booted, written, rtt, watch = f"boot-{i}-{t0}", t0 - 86400 * (i + 1), 3e9 * (i + 1), None, []
+    stopped, crashed = set(), False  # demo-pi-1 "crashes" its first watched service once
+    apt = {"upgradable": [0, 12, 3][i % 3], "security": [0, 2, 0][i % 3], "checked": time.time() - 3600,
+           "reboot_required": i == 1, "job": None}
+    apt_done_at = 0
     while True:
         t = time.time() - t0
+        if apt["job"] == "running" and time.time() > apt_done_at:
+            apt.update(job="done", upgradable=0, security=0, checked=time.time(), reboot_required=True)
+        # demo-pi-1's first watched service "crashes" 90 s after being watched, to exercise the watchdog.
+        if i == 0 and watch and t > 90 and not crashed:
+            stopped.add(watch[0])
+            crashed = True
+        wr = random.uniform(2e4, 4e5) * (8 if i == 2 else 1)
+        written += wr * 5
         svcs = []
         for u, s in units.items():
             want = s["base"] * (1 + 0.5 * math.sin(t / 20 + len(u))) + (120 if u == hog and int(t / 60) % 3 == 1 else 0)
@@ -61,7 +74,8 @@ def fake(i):
         report = {
             "id": f"demo{i:02d}", "hostname": f"demo-pi-{i + 1}", "ts": time.time(), "results": results,
             "info": {"model": model, "os": "Debian GNU/Linux 13 (trixie)", "kernel": "6.12.47+rpt-rpi-v8",
-                     "arch": "aarch64", "cores": cores, "cgroup2": True, "systemd": True, "client": version},
+                     "arch": "aarch64", "cores": cores, "cgroup2": True, "systemd": True, "client": version, "boot_id": boot},
+            "apt": dict(apt), "watch": {u: ("failed" if u in stopped else "active") for u in watch},
             "metrics": {
                 "cpu": round(cpu, 1), "cores": [round(min(100, cpu * random.uniform(0.6, 1.4)), 1) for _ in range(cores)],
                 "load": [round(cpu / 100 * cores * f, 2) for f in (1.1, 1, 0.9)],
@@ -71,13 +85,18 @@ def fake(i):
                 "disks": [{"mount": "/", "total": 64 * 10 ** 9, "used": int([20, 40, 58][i % 3] * 10 ** 9)},
                           {"mount": "/boot/firmware", "total": 536 * 10 ** 6, "used": 70 * 10 ** 6}],
                 "net": {"rx": random.uniform(1e3, 3e6), "tx": random.uniform(1e3, 5e5)},
-                "uptime": 86400 * (i + 1) + t, "nprocs": 140 + i * 20,
+                "uptime": time.time() - booted, "nprocs": 140 + i * 20,
+                "disk_io": {"read": random.uniform(1e4, 1e6), "write": wr, "written_boot": written},
+                "root_ro": False, "rtt": rtt,
             },
             "procs": procs, "services": svcs,
         }
         results = []
+        t_req = time.monotonic()
         try:
             reply = json.loads(link.request("POST", "/api/report", json.dumps(report).encode()))
+            rtt = round((time.monotonic() - t_req) * 1000 + random.uniform(0.5, 3), 1)
+            watch = reply.get("watch") or []
         except Exception as e:
             print(f"demo-pi-{i + 1}: {e}")
             time.sleep(5)
@@ -90,7 +109,15 @@ def fake(i):
                 s["cpu_weight"] = a["cpu_weight"] or 100
             if a["type"] == "update":
                 version = VERSION
-            results.append({"id": a["id"], "ok": a["type"] in ("renice", "update") or bool(s), "msg": "demo"})
+            if a["type"] == "restart":
+                stopped.discard(a["unit"])
+            if a["type"] == "reboot":
+                boot, booted, written = f"boot-{i}-{time.time()}", time.time(), 0
+                apt["reboot_required"] = False
+            if a["type"] == "apt_upgrade":
+                apt["job"], apt_done_at = "running", time.time() + 40
+            ok = a["type"] in ("renice", "update", "restart", "reboot", "shutdown", "apt_upgrade", "apt_check") or bool(s)
+            results.append({"id": a["id"], "ok": ok, "msg": "demo"})
         time.sleep(reply.get("interval", 5))
 
 
@@ -105,14 +132,16 @@ def backfill(days=30):
             day = math.sin((t % 86400) / 86400 * 2 * math.pi)
             cpu = max(1, 20 + 15 * day + random.uniform(-5, 5) + (60 if random.random() < 0.01 else 0))
             rows.append((nid, t, cpu, 45 + 10 * day + i * 8, 45 + cpu * 0.3, cpu / 25, 30 + i * 20 + (now - t) / -86400,
-                         random.uniform(1e4, 2e6), random.uniform(1e3, 3e5)))
+                         random.uniform(1e4, 2e6), random.uniform(1e3, 3e5), random.uniform(2e4, 4e5), random.uniform(1, 4)))
         for h in range((now - days * 86400) // 3600 * 3600, now - 7 * 86400, 3600):
             day = math.sin((h % 86400) / 86400 * 2 * math.pi)
             cpu = 20 + 15 * day + random.uniform(-3, 3)
             hours.append((nid, h, cpu, cpu + 30, 45 + 10 * day, 60 + 10 * day, 45 + cpu * 0.3, 55 + cpu * 0.3,
-                          cpu / 25, 25 + i * 20, 5e5, 1e5, 60))
-        db.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
-        db.executemany("INSERT OR REPLACE INTO hourly VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", hours)
+                          cpu / 25, 25 + i * 20, 5e5, 1e5, 60, 1.5e5, 2.0))
+        db.executemany("INSERT INTO samples (node, ts, cpu, mem, temp, load1, disk, rx, tx, wr, rtt) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        db.executemany("INSERT OR REPLACE INTO hourly (node, ts, cpu, cpu_max, mem, mem_max, temp, temp_max, load1, disk, "
+                       "rx, tx, n, wr, rtt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", hours)
     db.commit()
     print(f"backfilled {days} days for {COUNT} demo Pis; restart the hub so it rolls the new samples up")
 

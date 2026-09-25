@@ -54,6 +54,13 @@ MemoryMax=48M
 WantedBy=multi-user.target
 EOF
 
+# `sudo pipulse`: the on-Pi menu (status, test, pair/encryption, update, log, restart, uninstall).
+cat > /usr/local/bin/pipulse <<'EOF'
+#!/bin/sh
+exec /usr/bin/python3 /opt/pipulse-client/client.py --menu "$@"
+EOF
+chmod 755 /usr/local/bin/pipulse
+
 if ! python3 /opt/pipulse-client/client.py --check; then
   echo "Installed, but the hub can't be reached at https://$HOST:$PORT yet."
   echo "The client will keep retrying. Check that port $PORT is open on the hub."
@@ -62,3 +69,4 @@ systemctl daemon-reload
 systemctl enable pipulse-client >/dev/null 2>&1
 systemctl restart pipulse-client
 echo "PiPulse Client $VERSION installed. $(hostname) reports to $HOST over an encrypted link."
+echo "On this Pi, run  sudo pipulse  for status, troubleshooting and updates."

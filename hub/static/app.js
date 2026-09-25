@@ -70,13 +70,14 @@ $('#logoutBtn').onclick = async () => {
 
 function route() {
   view = (location.hash.slice(1) || 'pis').split('/')[0];
-  if (!['pis', 'events', 'settings'].includes(view)) view = 'pis';
+  if (!['pis', 'events', 'settings', 'about'].includes(view)) view = 'pis';
   $$('.view').forEach(v => v.hidden = v.id !== 'view-' + view);
   $$('nav.views a').forEach(a => a.classList.toggle('on', a.dataset.view === view));
   if (!signedIn) return;
   poll();
   if (view === 'events') loadEvents();
   if (view === 'settings') loadSettings();
+  if (view === 'about') loadAbout();
 }
 addEventListener('hashchange', route);
 
@@ -138,12 +139,19 @@ function renderGrid() {
   const nodes = [...state.nodes].sort((a, b) => nodeName(a).localeCompare(nodeName(b)));
   $('#empty').hidden = nodes.length > 0;
   $$('pre.cmd').forEach(p => p.textContent = state.install || '');
-  $$('.hubUrl').forEach(s => s.textContent = location.origin);
+  // The install command already carries the hub's LAN address (never localhost).
+  $$('.hubUrl').forEach(s => s.textContent = (state.install || '').match(/https?:\/\/[^/']+/)?.[0] || location.origin);
   $('#grid').innerHTML = nodes.map(card).join('');
   for (const c of $$('canvas.spark')) {
     const n = nodes.find(n => n.id === c.dataset.id);
     if (n) spark(c, n.hist);
   }
+  const outdated = nodes.filter(n => n.online && n.outdated);
+  $('#fleetBar').hidden = !outdated.length;
+  $('#fleetBar').innerHTML = outdated.length ? `<span>${outdated.length} Pi${outdated.length > 1 ? 's run' : ' runs'} an older client than this hub (${esc(state.version)}).</span>
+    <button class="btn small" data-updateall>Update all Pis</button>` : '';
+  $('#updBanner').hidden = !state.update_available;
+  $('#updBanner').textContent = state.update_available ? `PiPulse ${state.update_available} is available` : '';
   const on = nodes.filter(n => n.online).length, bad = nodes.filter(n => n.alerts.some(a => a[0] === 'crit')).length;
   $('#totals').textContent = nodes.length ? `${on}/${nodes.length} online${bad ? ` · ${bad} need attention` : ''}` : '';
   const sel = $('#evNode'), cur = sel.value;
@@ -213,6 +221,7 @@ const tabs = {
           <span>Network</span><span>↓ ${bytes(m.net.rx)}/s · ↑ ${bytes(m.net.tx)}/s</span>
           <span>Uptime</span><span>${dur(m.uptime)}</span></div>
           <div style="margin-top:10px">${thText}</div></div>
+        ${healthBox(n, m)}
         <div class="box"><h3>System</h3><div class="kv">
           <span>Model</span><span>${esc(n.info.model)}</span><span>OS</span><span>${esc(n.info.os)}</span>
           <span>Kernel</span><span>${esc(n.info.kernel)} (${esc(n.info.arch)})</span>
@@ -224,6 +233,7 @@ const tabs = {
 
   services(n) {
     const cores = n.info.cores || 1;
+    const watch = n.prefs?.watch || {};
     const rows = n.services.map(s => {
       const limits = [
         s.cpu_quota ? `<span class="tag">CPU ≤ ${(s.cpu_quota / 100).toFixed(2).replace(/\.?0+$/, '')} core</span>` : '',
@@ -233,10 +243,11 @@ const tabs = {
       const u = esc(s.unit);
       return `<tr><td class="mono">${u}</td><td class="num">${s.cpu.toFixed(1)}%</td><td class="num">${bytes(s.mem)}</td>
         <td class="num">${s.tasks}</td><td>${limits || '<span class="muted">none</span>'}</td>
-        <td class="acts"><button class="btn small ghost" data-limit="${u}">Limit</button>
+        <td class="acts">${s.unit.endsWith('.service') ? `<button class="btn small ${watch[s.unit] ? '' : 'ghost'}" data-watch="${u}" title="Alert if it stops">${watch[s.unit] ? 'Watching' : 'Watch'}</button>` : ''}
+        <button class="btn small ghost" data-limit="${u}">Limit</button>
         ${s.unit.endsWith('.service') ? `<button class="btn small ghost" data-restart="${u}">Restart</button>` : ''}</td></tr>`;
     }).join('');
-    return `<div class="hint">Put a cap on any service that hogs the Pi. <b>CPU %</b> is of one core (${cores} cores = ${cores * 100}%). Caps apply straight away and stay in place after a reboot.</div>
+    return watchPanel(n) + `<div class="hint">Put a cap on any service that hogs the Pi. <b>CPU %</b> is of one core (${cores} cores = ${cores * 100}%). Caps apply straight away and stay in place after a reboot.</div>
       <table><thead><tr><th>Service</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Tasks</th><th>Limits</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="6" class="muted">No services reported (needs systemd + cgroup v2).</td></tr>'}</tbody></table>`;
   },
@@ -270,6 +281,8 @@ const CHARTS = [
   { title: 'Load (1 min)', unit: '', series: [['load1', '#c084fc', 'load']] },
   { title: 'Root disk used', unit: '%', max: 100, series: [['disk', '#f472b6', 'used']] },
   { title: 'Network', unit: 'B/s', bytes: true, series: [['rx', '#34d399', 'down'], ['tx', '#60a5fa', 'up']] },
+  { title: 'Disk writes (SD wear)', unit: 'B/s', bytes: true, series: [['wr', '#fb923c', 'written']] },
+  { title: 'Link latency to hub', unit: 'ms', series: [['rtt', '#a3e635', 'round trip']] },
 ];
 
 async function loadHistory() {
@@ -431,43 +444,55 @@ const SETTING_GROUPS = [
               ['temp_warn', 'Temperature warning', '°C'], ['temp_crit', 'Temperature critical', '°C'],
               ['mem_warn', 'Memory warning', '% used'], ['mem_crit', 'Memory critical', '% used'],
               ['disk_warn', 'Disk warning', '% full'], ['disk_crit', 'Disk critical', '% full'],
-              ['swap_warn', 'Swap warning', '% used'], ['load_warn', 'Load warning', '× cores', '5-minute load average per CPU core.']]],
+              ['swap_warn', 'Swap warning', '% used'], ['load_warn', 'Load warning', '× cores', '5-minute load average per CPU core.'],
+              ['write_warn', 'Disk-write warning', 'MB/min', 'Heavy writing wears out SD cards. 0 turns this off.']]],
   ['History', [['raw_days', 'Keep full detail for', 'days', 'Every report, every few seconds.'],
                ['hourly_days', 'Keep hourly averages for', 'days'],
                ['event_days', 'Keep events for', 'days']]],
+  ['NAS storage', [['nas_data_dir', 'Logs folder', '', 'Hourly database mirror, plus the archive of everything past the history limits above.', 'path'],
+                   ['mirror_hours', 'Mirror every', 'hours', '0 turns the mirror off.'],
+                   ['archive', 'Archive old data to the NAS', '', 'Instead of deleting it when it passes the history limits.', 'bool'],
+                   ['nas_backup_dir', 'Backup folder', '', 'Nightly backup: database + hub certificate and key.', 'path'],
+                   ['backup_hour', 'Back up at', "o'clock", '0–23, local time.'],
+                   ['backup_keep', 'Keep', 'backups']]],
+  ['Updates', [['update_check', 'Check GitHub for new releases daily', '', 'Nothing is installed until you click Update on the About page.', 'bool']]],
 ];
 
 async function loadSettings() {
   try { settingsData = await api('/api/settings'); } catch { return; }
   const d = settingsData, s = d.settings;
-  $('#settingsBody').innerHTML = SETTING_GROUPS.map(([title, fields]) => `<div class="box"><h3>${title}</h3>${fields.map(([k, label, unit, help]) => {
+  $('#settingsBody').innerHTML = SETTING_GROUPS.map(([title, fields]) => `<div class="box ${title === 'NAS storage' ? 'wideBox' : ''}"><h3>${title}</h3>${fields.map(([k, label, unit, help, type]) => {
+    const helpHtml = help ? `<small class="muted">${help}</small>` : '';
+    if (type === 'path') return `<label class="field pathField"><span>${label}</span>
+      <input type="text" name="${k}" value="${esc(s[k])}" placeholder="off" spellcheck="false">${helpHtml}</label>`;
+    if (type === 'bool') return `<label class="field"><span>${label}</span><input type="checkbox" name="${k}" ${s[k] ? 'checked' : ''}>${helpHtml}</label>`;
     const [lo, hi] = d.limits[k];
     return `<label class="field"><span>${label}</span><span class="inp"><input type="number" name="${k}" value="${s[k]}" min="${lo}" max="${hi}" step="${Number.isInteger(lo) ? 1 : 0.1}" required><em>${unit}</em></span>
-      ${help ? `<small class="muted">${help}</small>` : ''}</label>`;
+      ${helpHtml}</label>`;
   }).join('')}${title === 'History' ? `<p class="muted small">Database: ${bytes(d.db.bytes)} · ${d.db.samples.toLocaleString()} detailed samples · ${d.db.hourly.toLocaleString()} hourly rows · ${d.db.events.toLocaleString()} events</p>` : ''}</div>`).join('');
   $('#secBox').innerHTML = `<h3>Encrypted client link</h3>
     <p>Clients send reports over HTTPS on port <b>${d.link_port}</b>. The hub uses its own certificate, and every client checks it against this fingerprint before sending anything:</p>
     <pre class="fp">${esc(d.fingerprint)}</pre>
     <p class="muted small">If you move the hub to a new Pi, copy <code>${esc(d.data)}</code> across (including <code>hub-cert.pem</code> and <code>hub-key.pem</code>) so your clients keep trusting it.</p>
     <h3 style="margin-top:14px">Add a Pi</h3><pre class="cmd">${esc(d.install)}</pre>`;
-  $('#aboutBox').innerHTML = `<h3>About this hub</h3><div class="kv">
-    <span>Version</span><span>PiPulse Hub ${esc(d.version)}</span>
-    <span>Running on</span><span>${esc(d.hostname)}</span>
-    <span>Up for</span><span>${dur(Date.now() / 1000 - d.started)}</span>
-    <span>Dashboard</span><span>port ${d.web_port}</span>
-    <span>Data</span><span class="mono">${esc(d.data)}</span></div>`;
   $('#setMsg').textContent = '';
+  renderGuards();
+  loadNas();
 }
 
 $('#settingsForm').addEventListener('submit', async e => {
   e.preventDefault();
   const s = settingsData.settings, changes = {};
-  for (const inp of $$('#settingsBody input')) if (+inp.value !== s[inp.name]) changes[inp.name] = +inp.value;
+  for (const inp of $$('#settingsBody input')) {
+    const v = inp.type === 'checkbox' ? (inp.checked ? 1 : 0) : inp.type === 'text' ? inp.value.trim() : +inp.value;
+    if (v !== s[inp.name]) changes[inp.name] = v;
+  }
   if (!Object.keys(changes).length) return $('#setMsg').textContent = 'Nothing changed.';
   try {
     await api('/api/settings', { method: 'POST', body: JSON.stringify(changes) });
     await loadSettings();
     $('#setMsg').textContent = 'Saved.';
+    setTimeout(() => $('#setMsg').textContent === 'Saved.' && ($('#setMsg').textContent = ''), 4000);
   } catch (err) { $('#setMsg').textContent = err.message; }
 });
 
@@ -481,21 +506,207 @@ $('#pwForm').addEventListener('submit', async e => {
   } catch (err) { $('#pwMsg').textContent = err.message; }
 });
 
+// ------------------------------------------------------------------ health, OS updates, watchdog
+
+function healthBox(n, m) {
+  const a = n.apt, io = m.disk_io || {};
+  const job = a?.job === 'running' ? '<span class="tag warnTag">installing updates…</span>'
+    : a?.job === 'failed' ? '<span class="tag critTag">last upgrade failed; see the Pi\'s log</span>' : '';
+  const apt = !a ? '<span class="muted">not reported (older client)</span>'
+    : a.upgradable == null ? '<span class="muted">checking…</span>'
+    : a.upgradable === 0 ? '<span style="color:var(--accent)">up to date</span>'
+    : `<b>${a.upgradable}</b> waiting${a.security ? `, <b style="color:var(--warn)">${a.security} security</b>` : ''}`;
+  return `<div class="box"><h3>Health &amp; updates</h3><div class="kv">
+      <span>Disk writes</span><span>${bytes(io.write)}/s now · ${bytes(io.written_boot)} since boot</span>
+      <span>Root filesystem</span><span>${m.root_ro ? '<b style="color:var(--crit)">read-only</b>' : 'read-write'}</span>
+      <span>Link to hub</span><span>${m.rtt == null ? '–' : m.rtt + ' ms round trip'} · encrypted</span>
+      <span>OS updates</span><span>${apt} ${job}</span>
+      ${a?.checked ? `<span>Checked</span><span>${when(a.checked)}</span>` : ''}
+      ${a?.reboot_required ? '<span>Reboot</span><span style="color:var(--warn)">needed to finish updates</span>' : ''}</div>
+    <div class="row wrap" style="margin-top:12px">
+      <button class="btn small ghost" data-apt="check">Check for updates</button>
+      <button class="btn small ${a?.upgradable ? '' : 'ghost'}" data-apt="upgrade" ${a?.job === 'running' ? 'disabled' : ''}>Install OS updates</button>
+      <span class="spacer"></span>
+      <button class="btn small ghost" data-power="reboot">Reboot</button>
+      <button class="btn small ghost danger" data-power="shutdown">Shut down</button></div></div>`;
+}
+
+function watchPanel(n) {
+  const watch = n.prefs?.watch || {}, st = n.watch_status || {}, units = Object.keys(watch).sort();
+  const rows = units.map(u => {
+    const s = st[u] || 'waiting for report', ok = ['active', 'reloading', 'activating'].includes(s);
+    return `<tr><td class="mono">${esc(u)}</td><td><span class="tag ${ok ? '' : 'critTag'}">${esc(s)}</span></td>
+      <td><button class="btn small ${watch[u].restart ? '' : 'ghost'}" data-autorestart="${esc(u)}">${watch[u].restart ? 'Auto-restart on' : 'Auto-restart off'}</button></td>
+      <td class="acts"><button class="btn small ghost" data-unwatch="${esc(u)}">Stop watching</button></td></tr>`;
+  }).join('');
+  return `<div class="box watchBox"><h3>Watched services</h3>
+    <p class="muted small">You get an alert if one of these stops. With auto-restart on, the hub restarts it: at most once every 2 minutes and 3 times an hour, then it gives up and tells you.</p>
+    ${units.length ? `<table><tbody>${rows}</tbody></table>` : ''}
+    <div class="row" style="margin-top:8px"><input id="addWatch" placeholder="service name, e.g. medialedger" spellcheck="false">
+      <button class="btn small" data-addwatch>Watch</button></div></div>`;
+}
+
+async function setWatch(unit, watch, restart) {
+  try {
+    const r = await api(`/api/node/${encodeURIComponent(openId)}/watch`, { method: 'POST', body: JSON.stringify({ unit, watch, restart }) });
+    detail.prefs = r.prefs;
+    renderDetail(true);
+  } catch (e) { alert(e.message); }
+}
+
+// ------------------------------------------------------------------ NAS storage & backups (Settings)
+
+let nasTimer = null;
+async function loadNas() {
+  clearTimeout(nasTimer);
+  let d;
+  try { d = await api('/api/nas'); } catch { return; }
+  const job = (k, label) => {
+    const j = d.status[k];
+    if (!j) return `<span>${label}</span><span class="muted">not run yet</span>`;
+    return `<span>${label}</span><span><b style="color:var(--${j.ok ? 'accent' : 'crit'})">${j.ok ? '✓' : '✕'}</b> ${esc(j.msg)} <span class="muted">· ${when(j.at)}</span></span>`;
+  };
+  const dir = (k, label) => {
+    const x = d.dirs[k];
+    return `<span>${label}</span><span>${x.path ? `<span class="mono">${esc(x.path)}</span> ` : ''}${x.ok ? '<b style="color:var(--accent)">reachable</b>' : `<b style="color:var(--${x.path ? 'crit' : 'muted'})">${esc(x.msg)}</b>`}</span>`;
+  };
+  $('#nasBox').innerHTML = `<h3>NAS status</h3><div class="kv">
+      ${dir('nas_data_dir', 'Logs folder')}${dir('nas_backup_dir', 'Backup folder')}
+      ${job('mirror', 'Last mirror')}${job('archive', 'Last archive')}${job('backup', 'Last backup')}</div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn small ghost" data-nas="mirror" ${d.running ? 'disabled' : ''}>Mirror now</button>
+      <button class="btn small" data-nas="backup" ${d.running ? 'disabled' : ''}>Back up now</button>
+      ${d.running ? `<span class="muted">${esc(d.running)} running…</span>` : ''}</div>
+    ${d.backups.length ? `<details style="margin-top:12px"><summary>${d.backups.length} backups on the NAS</summary>
+      <table>${d.backups.map(b => `<tr><td class="mono">${esc(b.name)}</td><td class="num">${bytes(b.size)}</td></tr>`).join('')}</table>
+      <p class="muted small">To restore one, run on the hub Pi: <code>sudo pipulse-hub restore "&lt;backup folder&gt;/&lt;file&gt;"</code></p></details>` : ''}
+    <p class="muted small">On the hub Pi, <code>sudo pipulse-hub nas</code> connects (or reconnects) the NAS share and stores its login.</p>`;
+  if (d.running && view === 'settings') nasTimer = setTimeout(loadNas, 3000);
+}
+$('#nasBox').addEventListener('click', async e => {
+  const job = e.target.dataset.nas; if (!job) return;
+  try { await api('/api/nas/' + job, { method: 'POST' }); } catch (err) { alert(err.message); }
+  loadNas();
+});
+
+// ------------------------------------------------------------------ guard rules (Settings)
+
+function renderGuards() {
+  const rules = settingsData.settings.guards || [], nodes = [...state.nodes].sort((a, b) => nodeName(a).localeCompare(nodeName(b)));
+  const nodeSel = v => `<select data-g="node"><option value="">All Pis</option>${nodes.map(n => `<option value="${esc(n.id)}" ${n.id === v ? 'selected' : ''}>${esc(nodeName(n))}</option>`).join('')}</select>`;
+  const row = r => `<tr data-id="${esc(r.id || '')}">
+      <td><input type="checkbox" data-g="on" ${r.on !== false ? 'checked' : ''} title="Rule on"></td>
+      <td><input data-g="name" value="${esc(r.name || '')}" placeholder="name" size="12"></td>
+      <td><input data-g="match" value="${esc(r.match || '*')}" size="14" spellcheck="false" title="Service name; * and ? wildcards"></td>
+      <td>${nodeSel(r.node)}</td>
+      <td><select data-g="metric"><option value="cpu" ${r.metric !== 'mem' ? 'selected' : ''}>CPU above</option><option value="mem" ${r.metric === 'mem' ? 'selected' : ''}>RAM above</option></select></td>
+      <td><input type="number" data-g="above" value="${r.above ?? 150}" style="width:70px"></td>
+      <td><input type="number" data-g="minutes" value="${r.minutes ?? 5}" style="width:56px" step="0.5"></td>
+      <td><input type="number" data-g="cap" value="${r.cap ?? 100}" style="width:70px"></td>
+      <td><button type="button" class="btn small ghost danger" data-gdel>✕</button></td></tr>`;
+  $('#guardBox').innerHTML = `<h3>Guard rules</h3>
+    <p class="muted small">Automatic protection: when a service stays over a limit, cap it and log an event. CPU is % of one core (150 = 1.5 cores), RAM is MB.
+      A rule fires once per service; it won't touch a service that already has that kind of cap, or ${settingsData.protected.join(', ')}.</p>
+    <table class="guards"><thead><tr><th>On</th><th>Name</th><th>Service</th><th>Pi</th><th>When</th><th class="num">Over</th><th class="num">For min</th><th class="num">Cap at</th><th></th></tr></thead>
+      <tbody>${rules.map(row).join('')}</tbody></table>
+    <div class="row" style="margin-top:10px"><button type="button" class="btn small ghost" data-gadd>+ Add rule</button>
+      <span class="spacer"></span><span id="gMsg" class="muted"></span><button type="button" class="btn small" data-gsave>Save rules</button></div>`;
+  $('#guardBox').onclick = async e => {
+    if (e.target.dataset.gadd !== undefined) {
+      $('#guardBox tbody').insertAdjacentHTML('beforeend', row({ name: 'CPU hog', match: '*', metric: 'cpu', above: 150, minutes: 5, cap: 100 }));
+    }
+    if (e.target.dataset.gdel !== undefined) e.target.closest('tr').remove();
+    if (e.target.dataset.gsave !== undefined) {
+      const guards = $$('#guardBox tbody tr').map(tr => {
+        const g = k => tr.querySelector(`[data-g="${k}"]`);
+        return { id: tr.dataset.id, on: g('on').checked, name: g('name').value, match: g('match').value, node: g('node').value,
+                 metric: g('metric').value, above: +g('above').value, minutes: +g('minutes').value, cap: +g('cap').value };
+      });
+      try {
+        const r = await api('/api/guards', { method: 'POST', body: JSON.stringify({ guards }) });
+        settingsData.settings.guards = r.guards; renderGuards(); $('#gMsg').textContent = 'Saved.';
+      } catch (err) { $('#gMsg').textContent = err.message; }
+    }
+  };
+}
+
+// ------------------------------------------------------------------ About
+
+let aboutTimer = null;
+async function loadAbout() {
+  clearTimeout(aboutTimer);
+  let d;
+  try { d = await api('/api/about'); } catch { return; }
+  const u = d.update, l = u.latest || {};
+  let action;
+  if (u.in_progress) action = '<p><b>Updating the hub…</b> The dashboard reconnects by itself when it\'s done.</p>';
+  else if (u.available && u.managed) action = `<button class="btn" data-hubupdate>Update hub to ${esc(u.available)}</button>`;
+  else if (u.available) action = `<p class="muted">This hub wasn't installed with the Pi installer, so update it by hand: ${esc(u.available)} is on <a href="${esc(l.url)}" target="_blank" rel="noopener">GitHub</a>.</p>`;
+  else action = '<p style="color:var(--accent)">This hub is up to date.</p>';
+  const outdated = state.nodes.filter(n => n.online && n.outdated).length;
+  $('#updBox').innerHTML = `<h3>Updates</h3><div class="kv">
+      <span>Installed</span><span>PiPulse ${esc(d.version)}</span>
+      <span>Latest release</span><span>${l.version ? esc(l.version) + (l.published ? ` <span class="muted">(${esc(l.published.slice(0, 10))})</span>` : '') : '<span class="muted">not checked yet</span>'}</span>
+      <span>Last checked</span><span>${l.checked ? when(l.checked) : '–'}${l.error ? ` <span style="color:var(--warn)">(${esc(l.error)})</span>` : ''}</span></div>
+    <div style="margin:14px 0 6px">${action}</div>
+    <div class="row wrap"><button class="btn small ghost" data-checkupd ${u.checking ? 'disabled' : ''}>${u.checking ? 'Checking…' : 'Check now'}</button>
+      ${outdated ? `<button class="btn small" data-updateall>Update all Pis (${outdated})</button>` : '<span class="muted small">All Pis run this hub\'s client version.</span>'}</div>
+    <p class="muted small">Hub updates come from GitHub releases (${esc(d.repo)}) and are checked against the release's SHA256SUMS. Pis update from this hub, over the encrypted link.</p>
+    ${u.available && l.notes ? `<details open><summary>What's in ${esc(u.available)}</summary><div class="md">${md(l.notes)}</div></details>` : ''}`;
+  $('#hubBox').innerHTML = `<h3>This hub</h3><div class="kv">
+      <span>Running on</span><span>${esc(d.hostname)}</span><span>System</span><span>${esc(d.os)}</span>
+      <span>Python</span><span>${esc(d.python)}</span><span>Up for</span><span>${dur(Date.now() / 1000 - d.started)}</span>
+      <span>Data</span><span class="mono">${esc(d.data)}</span>
+      <span>Database</span><span>${bytes(d.db.bytes)} · ${d.db.samples.toLocaleString()} samples · ${d.db.events.toLocaleString()} events</span>
+      <span>Source</span><span><a href="https://github.com/${esc(d.repo)}" target="_blank" rel="noopener">github.com/${esc(d.repo)}</a></span>
+      <span>License</span><span>MIT</span></div>
+    <p class="muted small" style="margin-top:12px">Standard-library Python on both ends: no pip packages, no Docker, no cloud. Made by AxialForge.</p>`;
+  $('#changelog').innerHTML = md(d.changelog.replace(/^# Changelog[\s\S]*?(?=^## )/m, ''));
+  if (u.in_progress || u.checking) aboutTimer = setTimeout(() => view === 'about' && loadAbout(), 3000);
+}
+$('#view-about').addEventListener('click', async e => {
+  if (e.target.dataset.checkupd !== undefined) { await api('/api/update/check', { method: 'POST' }).catch(() => {}); setTimeout(loadAbout, 400); }
+  if (e.target.dataset.hubupdate !== undefined) {
+    if (!confirm('Update the hub now? The dashboard goes away for a minute while it restarts.')) return;
+    try { await api('/api/update/hub', { method: 'POST' }); } catch (err) { return alert(err.message); }
+    loadAbout();
+  }
+});
+
+// Just enough Markdown for release notes: headings, bullets, bold, code, links. Escapes first.
+function md(text) {
+  const inline = t => esc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  let html = '', list = false, para = [];
+  const flush = () => { if (para.length) { html += `<p>${inline(para.join(' '))}</p>`; para = []; } };
+  for (const raw of text.split('\n')) {
+    const line = raw.trimEnd(), h = line.match(/^(#{2,4})\s+(.*)/), li = line.match(/^\s*[-*]\s+(.*)/);
+    if (li) { flush(); if (!list) { html += '<ul>'; list = true; } html += `<li>${inline(li[1])}</li>`; continue; }
+    if (list && /^\s{2,}\S/.test(line)) { html = html.replace(/<\/li>$/, ' ' + inline(line.trim()) + '</li>'); continue; }
+    if (list) { html += '</ul>'; list = false; }
+    if (h) { flush(); html += `<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`; }
+    else if (!line.trim()) flush();
+    else if (!line.startsWith('```')) para.push(line);
+  }
+  flush(); if (list) html += '</ul>';
+  return html;
+}
+
 // ------------------------------------------------------------------ wiring
 
 $('#grid').addEventListener('click', e => {
   const c = e.target.closest('.card'); if (!c) return;
   openId = c.dataset.id; tab = 'overview';
-  $$('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $$('#nodeTabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('#tabBody').innerHTML = '<p class="muted">Loading…</p>';
   $('#nodeDlg').showModal();
   loadDetail();
 });
 $('#nodeDlg').addEventListener('close', () => { openId = null; detail = null; clearTimeout(histTimer); $('#tip').hidden = true; });
-$('.tabs').addEventListener('click', e => {
+$('#nodeTabs').addEventListener('click', e => {
   if (!e.target.dataset.tab) return;
   tab = e.target.dataset.tab;
-  $$('.tabs button').forEach(b => b.classList.toggle('on', b === e.target));
+  $$('#nodeTabs button').forEach(b => b.classList.toggle('on', b === e.target));
   $('#tabBody').innerHTML = '';
   $('#tabBody').scrollTop = 0;
   if (detail) renderDetail(true);
@@ -505,6 +716,21 @@ $('#tabBody').addEventListener('click', e => {
   if (b.dataset.range) { histRange = b.dataset.range; $$('.seg button').forEach(x => x.classList.toggle('on', x === b)); return loadHistory(); }
   if (b.dataset.evnode) { $('#nodeDlg').close(); $('#evNode').value = b.dataset.evnode; return; }
   if (b.dataset.limit) openLimit(b.dataset.limit);
+  if (b.dataset.watch) setWatch(b.dataset.watch, !(detail.prefs?.watch || {})[b.dataset.watch], false);
+  if (b.dataset.unwatch) setWatch(b.dataset.unwatch, false, false);
+  if (b.dataset.autorestart) setWatch(b.dataset.autorestart, true, !(detail.prefs.watch[b.dataset.autorestart] || {}).restart);
+  if (b.dataset.addwatch !== undefined) {
+    let u = $('#addWatch').value.trim();
+    if (u && !u.includes('.')) u += '.service';
+    if (u) setWatch(u, true, false);
+  }
+  if (b.dataset.power) {
+    const what = b.dataset.power === 'reboot' ? 'Reboot' : 'Shut down';
+    const extra = b.dataset.power === 'shutdown' ? '\n\nIt stays off until someone powers it back on.' : '';
+    if (confirm(`${what} ${nodeName(detail)}?${extra}`)) act({ type: b.dataset.power });
+  }
+  if (b.dataset.apt === 'upgrade' && confirm(`Install OS updates on ${nodeName(detail)}? It runs apt upgrade in the background, which can take a while.`)) act({ type: 'apt_upgrade' });
+  if (b.dataset.apt === 'check') act({ type: 'apt_check' });
   if (b.dataset.update !== undefined && confirm(`Update the client on ${nodeName(detail)} to ${detail.hub_version}? It restarts itself.`)) act({ type: 'update' });
   if (b.dataset.restart && confirm(`Restart ${b.dataset.restart} on ${detail.hostname}?`)) act({ type: 'restart', unit: b.dataset.restart });
   if (b.dataset.renice) {
@@ -526,9 +752,39 @@ $('#forgetBtn').onclick = async () => {
 $('#addBtn').onclick = async () => {
   if (!settingsData) await loadSettings();
   $$('.ports').forEach(s => s.textContent = `${settingsData.web_port} (install) and ${settingsData.link_port} (reports)`);
+  $('#addCmd').textContent = state.install;
+  sshCmds();
   $('#addDlg').showModal();
 };
-$('[data-copy]').onclick = e => { navigator.clipboard?.writeText(state.install); e.target.textContent = 'Copied'; setTimeout(() => e.target.textContent = 'Copy', 1500); };
+$('.addTabs').addEventListener('click', e => {
+  const t = e.target.dataset.addtab; if (!t) return;
+  $$('.addTabs button').forEach(b => b.classList.toggle('on', b === e.target));
+  $$('[data-addpane]').forEach(p => p.hidden = p.dataset.addpane !== t);
+});
+// One ssh line per Pi. -t gives sudo a terminal to ask for the password on. The
+// install command sits inside double quotes and keeps its own single quotes, which
+// works the same in PowerShell, cmd and bash.
+function sshCmds() {
+  const user = $('#sshUser').value.trim() || 'pi';
+  const hosts = $('#sshHosts').value.split(/[\s,]+/).filter(Boolean);
+  const line = h => `ssh -t ${user}@${h} "${state.install}"`;
+  $('#sshCmd').textContent = (hosts.length ? hosts : ['<pi-address>']).map(line).join('\n');
+}
+['#sshUser', '#sshHosts'].forEach(s => $(s).addEventListener('input', sshCmds));
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-copy], [data-updateall]'); if (!b) return;
+  if (b.dataset.copy !== undefined) {
+    navigator.clipboard?.writeText($('#' + b.dataset.copy)?.textContent || state.install);
+    const old = b.textContent; b.textContent = 'Copied'; setTimeout(() => b.textContent = old, 1500);
+  }
+  if (b.dataset.updateall !== undefined) {
+    try {
+      const r = await api('/api/update/clients', { method: 'POST' });
+      b.textContent = r.queued.length ? `Updating ${r.queued.length}…` : 'Nothing to update';
+    } catch (err) { alert(err.message); }
+    poll();
+  }
+});
 addEventListener('resize', () => { renderGrid(); if (tab === 'history' && openId) loadHistory(); });
 
 route();

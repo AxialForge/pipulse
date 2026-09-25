@@ -5,11 +5,12 @@ the limits the hub asks for.
 Standard library only. Every few seconds it reads /proc and the cgroup v2 tree
 and sends one JSON report over HTTPS to the hub's client link. The hub's
 certificate must match the SHA-256 fingerprint pinned at install time, or
-nothing is sent. The reply carries any actions to run: service limits via
-`systemctl set-property`, renice, restart, or self-update. The Pi never listens
-on a port.
+nothing is sent. The reply carries any actions to run, and which services to
+watch. Actions are service limits via `systemctl set-property`, renice,
+restart, reboot/shutdown, OS updates, or self-update. The Pi never listens on a port.
 
     client.py            run (config in /etc/pipulse/client.json)
+    client.py --menu     the on-Pi menu (installed as `sudo pipulse`)
     client.py --check    test the connection to the hub and exit
     client.py --once     print one report and exit
 """
@@ -22,6 +23,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 
 try:
@@ -33,6 +35,9 @@ VERSION = "dev"  # stamped by the hub / release packaging
 CONFIG = os.environ.get("PIPULSE_CONFIG", "/etc/pipulse/client.json")
 CG = "/sys/fs/cgroup"
 UNIT_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+\.(service|scope|slice)$")
+DISK_RE = re.compile(r"^(mmcblk\d+|sd[a-z]+|nvme\d+n\d+|vd[a-z]+)$")
+STATUS = "/run/pipulse-client.json"   # tmpfs: what the menu shows, no SD writes
+LOG_UNIT = "pipulse-client"
 LOCAL_FS = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs3", "fuseblk"}
 
 
@@ -110,6 +115,7 @@ def static_info():
         "cgroup2": os.path.exists(CG + "/cgroup.controllers"),
         "systemd": os.path.isdir("/run/systemd/system"),
         "client": VERSION,
+        "boot_id": read("/proc/sys/kernel/random/boot_id").strip(),  # changes on every boot
     }
 
 
@@ -128,6 +134,28 @@ class Sampler:
         self.units = {}
         self.throttle = (0, None)
         self.users = {}
+        self.io = None
+
+    def disk_io(self, dt):
+        """Read/write rate to the physical disks (SD card, USB SSD, NVMe), not partitions."""
+        rd = wr = 0
+        for line in read("/proc/diskstats").splitlines():
+            f = line.split()
+            if len(f) > 9 and DISK_RE.match(f[2]):
+                rd += int(f[5]) * 512
+                wr += int(f[9]) * 512
+        prev, self.io = self.io, (rd, wr)
+        if not prev or not dt:
+            return {"read": 0, "write": 0, "written_boot": wr}
+        return {"read": max(0, (rd - prev[0]) / dt), "write": max(0, (wr - prev[1]) / dt), "written_boot": wr}
+
+    @staticmethod
+    def root_ro():
+        for line in read("/proc/mounts").splitlines():
+            f = line.split()
+            if len(f) > 3 and f[1] == "/":
+                return "ro" in f[3].split(",")
+        return False
 
     def cpu_times(self):
         out = []
@@ -295,7 +323,7 @@ class Sampler:
                 "cpu": pct[0] if pct else None, "cores": pct[1:],
                 "load": [float(x) for x in read("/proc/loadavg").split()[:3]],
                 "mem": self.mem(), "temp": self.temp(), "throttled": self.throttled(),
-                "disks": self.disks(), "net": net,
+                "disks": self.disks(), "net": net, "disk_io": self.disk_io(dt), "root_ro": self.root_ro(),
                 "uptime": float(read("/proc/uptime", "0").split()[0]), "nprocs": nprocs,
             },
             "procs": procs,
@@ -356,7 +384,103 @@ def _update(a, link):
     return True, "updated; restarting"
 
 
-def do_action(a, cores, link):
+def outside(*cmd, timeout=600, **props):
+    """Run a command in its own transient systemd unit and wait for its output.
+    This service is boxed in at 10% CPU / 48 MB and everything it starts inherits
+    that box. apt inside it would be starved or OOM-killed, and could take this
+    process down with it."""
+    args = ["systemd-run", "--quiet", "--collect", "--wait", "--pipe"]
+    for k, v in props.items():
+        args += ["-p", f"{k}={v}"]
+    return run(args + list(cmd), timeout=timeout)
+
+
+def has_cmd(cmd):
+    return any(os.access(os.path.join(p, cmd), os.X_OK) for p in os.environ.get("PATH", "/usr/bin").split(":"))
+
+
+class Apt:
+    """Waiting OS updates, checked every 6 h and again after an upgrade finishes."""
+    JOB = "pipulse-apt-upgrade"
+
+    def __init__(self):
+        self.state = {"upgradable": None, "security": None, "checked": 0,
+                      "reboot_required": False, "job": None}
+        self.checking = False
+        self.prev_job = None
+
+    def due(self):
+        if not self.checking and time.time() - self.state["checked"] > 6 * 3600 and has_cmd("apt-get"):
+            self.check()
+
+    def check(self):
+        if self.checking:
+            return
+        self.checking = True
+
+        def work():
+            try:
+                code, out = outside("apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade",
+                                    MemoryMax="300M", CPUQuota="50%", Nice="10")
+                inst = [line for line in out.splitlines() if line.startswith("Inst ")]
+                if code == 0:
+                    self.state.update(upgradable=len(inst), security=sum("security" in line.lower() for line in inst))
+                self.state["checked"] = time.time()
+            finally:
+                self.checking = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def job(self):
+        _, out = run(["systemctl", "show", self.JOB, "-p", "LoadState", "-p", "ActiveState", "-p", "SubState"])
+        p = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if p.get("LoadState") != "loaded":
+            return None
+        if p.get("ActiveState") == "failed":
+            return "failed"
+        return "running" if p.get("SubState") == "running" else "done"
+
+    def upgrade(self):
+        if self.job() == "running":
+            return False, "an upgrade is already running"
+        run(["systemctl", "stop", self.JOB])
+        run(["systemctl", "reset-failed", self.JOB])
+        code, out = run(["systemd-run", "--quiet", "--unit", self.JOB, "--remain-after-exit",
+                         "-p", "Nice=10", "-p", "IOSchedulingClass=idle", "--setenv=DEBIAN_FRONTEND=noninteractive",
+                         "sh", "-c", "apt-get update -q && apt-get -y -q -o Dpkg::Options::=--force-confdef "
+                                     "-o Dpkg::Options::=--force-confold upgrade"])
+        return code == 0, out or "upgrade started; its progress shows on the dashboard"
+
+    def report(self):
+        job = self.job()
+        if self.prev_job == "running" and job in ("done", "failed"):
+            self.state["checked"] = 0
+            self.check()  # the counts just changed
+        self.prev_job = job
+        self.state["job"] = job
+        self.state["reboot_required"] = os.path.exists("/var/run/reboot-required")
+        return dict(self.state)
+
+
+class Watch:
+    """systemd state of the services the hub asked us to watch (checked every 15 s)."""
+
+    def __init__(self):
+        self.units, self.states, self.at = [], {}, 0
+
+    def report(self, units):
+        units = [u for u in units if UNIT_RE.match(u)][:50]
+        if units != self.units or time.time() - self.at > 15:
+            self.units, self.at = units, time.time()
+            if units:
+                _, out = run(["systemctl", "is-active", "--"] + units)
+                lines = out.splitlines()
+                self.states = {u: (lines[i] if i < len(lines) else "unknown") for i, u in enumerate(units)}
+            else:
+                self.states = {}
+        return self.states
+
+
+def do_action(a, cores, link, apt):
     kind = a.get("type")
     try:
         if kind == "limit":
@@ -375,66 +499,336 @@ def do_action(a, cores, link):
             return code == 0, out or f"restarted {unit}"
         if kind == "update":
             return _update(a, link)
+        if kind in ("reboot", "shutdown"):
+            # Delayed, so this report's result reaches the hub before the network goes.
+            verb = "reboot" if kind == "reboot" else "poweroff"
+            code, out = run(["systemd-run", "--quiet", "--on-active=5", "systemctl", verb], timeout=15)
+            return code == 0, out or f"{kind} in 5 seconds"
+        if kind == "apt_upgrade":
+            return apt.upgrade()
+        if kind == "apt_check":
+            apt.check()
+            return True, "checking for OS updates"
         return False, f"unknown action {kind!r}"
     except Exception as e:  # an action must never kill the reporting loop
         return False, str(e)
 
 
-# ---------------------------------------------------------------- main loop
+# ---------------------------------------------------------------- config & pairing
 
-def load_config():
+def load_config(required=True):
     cfg = {"hub": "", "port": 8751, "token": "", "pin": "", "interval": 5}
     try:
         with open(CONFIG) as f:
             cfg.update(json.load(f))
     except OSError:
         pass
-    if not (cfg["hub"] and cfg["token"] and cfg["pin"]):
-        sys.exit(f"{CONFIG} needs hub, token and pin. Install the client from the hub's dashboard (+ Add a Pi).")
+    if required and not (cfg["hub"] and cfg["token"] and cfg["pin"]):
+        sys.exit(f"{CONFIG} needs hub, token and pin. Pair with `sudo pipulse`, or install from the hub's + Add a Pi.")
     return cfg
 
 
-def main():
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    os.replace(tmp, CONFIG)
+
+
+def peer_fingerprint(host, port):
+    """The certificate fingerprint a host presents. Only used while pairing, where
+    you compare it by eye with the one on the hub's Settings page."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(host, int(port), timeout=10, context=ctx)
+    try:
+        conn.connect()
+        return hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+    finally:
+        conn.close()
+
+
+def fmt_fp(fp):
+    fp = fp.replace(":", "")
+    return ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()
+
+
+def write_status(**kw):
+    try:
+        old = json.loads(read(STATUS) or "{}")
+        with open(STATUS + ".tmp", "w") as f:
+            json.dump(old | kw, f)
+        os.replace(STATUS + ".tmp", STATUS)
+    except (OSError, ValueError):
+        pass
+
+
+# ---------------------------------------------------------------- the report loop
+
+def serve():
     cfg = load_config()
     link = Link(cfg["hub"], cfg["port"], cfg["token"], cfg["pin"])
     info = static_info()
     ident = {"id": node_id(), "hostname": socket.gethostname(), "info": info}
-    sampler = Sampler()
-
-    if "--once" in sys.argv:
-        sampler.sample()
-        time.sleep(1)
-        return print(json.dumps(dict(ident, **sampler.sample()), indent=1))
-    if "--check" in sys.argv:
-        try:
-            print("hub reachable, certificate matches the pin, version", json.loads(link.request("GET", "/api/ping"))["version"])
-        except Exception as e:
-            sys.exit(f"cannot talk to the hub: {e}")
-        return
-
+    sampler, apt, watch = Sampler(), Apt(), Watch()
     sampler.sample()  # prime the counters so the first report has real rates
-    results, interval, restart = [], cfg["interval"], False
+    results, interval, restart, rtt, units = [], cfg["interval"], False, None, []
+    write_status(version=VERSION, hub=cfg["hub"], port=cfg["port"], started=time.time())
     print(f"PiPulse Client {VERSION} reporting to https://{cfg['hub']}:{cfg['port']} every {interval}s", flush=True)
     while True:
         time.sleep(interval)
-        report = dict(ident, ts=time.time(), results=results, **sampler.sample())
+        apt.due()
+        s = sampler.sample()
+        s["metrics"]["rtt"] = rtt
+        report = dict(ident, ts=time.time(), results=results, apt=apt.report(), watch=watch.report(units), **s)
+        t0 = time.monotonic()
         try:
             reply = json.loads(link.request("POST", "/api/report", json.dumps(report).encode()))
         except PinMismatch as e:
             print(f"SECURITY: {e}", flush=True)
+            write_status(last_error=f"SECURITY: {e}", last_error_at=time.time())
             continue
         except Exception as e:  # hub down or unreachable: keep sampling, keep results
             print(f"report failed: {e}", flush=True)
+            write_status(last_error=str(e), last_error_at=time.time())
             continue
+        rtt = round((time.monotonic() - t0) * 1000, 1)
+        write_status(last_ok=time.time(), rtt=rtt, interval=interval)
         if restart:
             sys.exit(0)  # the update result has been delivered; systemd starts the new version
         results = []
         interval = max(2, int(reply.get("interval", interval)))
+        units = reply.get("watch") or []
         for a in reply.get("actions", []):
-            ok, msg = do_action(a, info["cores"], link)
+            ok, msg = do_action(a, info["cores"], link, apt)
             print(f"action {a.get('type')} {'ok' if ok else 'FAILED'}: {msg}", flush=True)
             results.append({"id": a.get("id"), "ok": ok, "msg": msg[:500]})
             restart = restart or (a.get("type") == "update" and ok)
+
+
+# ---------------------------------------------------------------- `sudo pipulse`: the on-Pi menu
+
+def ask(prompt, default=""):
+    try:
+        v = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+    except EOFError:
+        return default
+    return v or default
+
+
+def pause():
+    ask("\nPress Enter to go back")
+
+
+def status_lines():
+    cfg = load_config(required=False)
+    st = json.loads(read(STATUS) or "{}")
+    _, active = run(["systemctl", "is-active", "pipulse-client"])
+    lines = [f"PiPulse Client {VERSION} on {socket.gethostname()}   service: {active or 'unknown'}"]
+    if not cfg["hub"]:
+        return lines + ["Not paired with a hub yet: choose 'Pair with a hub'."]
+    lines.append(f"Hub: {cfg['hub']}:{cfg['port']}   encrypted (TLS, hub certificate pinned)")
+    if st.get("last_ok"):
+        lines.append(f"Last report: {time.time() - st['last_ok']:.0f} s ago, {st.get('rtt', '?')} ms round trip")
+    if st.get("last_error_at", 0) > st.get("last_ok", 0):
+        lines.append(f"Last error: {st.get('last_error')}")
+    return lines
+
+
+def act_status():
+    cfg = load_config(required=False)
+    print("\n".join(status_lines()))
+    if cfg["pin"]:
+        print(f"\nPinned hub certificate:\n  {fmt_fp(cfg['pin'])}")
+        print("It must match Settings > Encrypted client link on the hub.")
+    pause()
+
+
+def act_test():
+    cfg = load_config(required=False)
+    if not cfg["hub"]:
+        print("Not paired yet.")
+        return pause()
+    print(f"Connecting to https://{cfg['hub']}:{cfg['port']} ...")
+    try:
+        got = peer_fingerprint(cfg["hub"], cfg["port"])
+    except OSError as e:
+        print(f"  cannot reach the hub: {e}\n  Is the hub on, and is port {cfg['port']} reachable from here?")
+        return pause()
+    if got != cfg["pin"].replace(":", "").lower():
+        print("  CERTIFICATE MISMATCH: something other than your hub answered, or the hub was\n"
+              "  reinstalled without its old certificate. Pair again only if you trust it.")
+        print(f"  pinned: {fmt_fp(cfg['pin'])}\n  seen:   {fmt_fp(got)}")
+        return pause()
+    print("  encryption OK: the hub's certificate matches the pin")
+    link = Link(cfg["hub"], cfg["port"], cfg["token"], cfg["pin"])
+    try:
+        link.request("GET", "/client.py")
+        print("  token OK: the hub accepts this Pi")
+        print("  hub version:", json.loads(link.request("GET", "/api/ping"))["version"])
+    except Exception as e:
+        print(f"  the hub refused this Pi's token ({e}). Pair again with the token from + Add a Pi.")
+    pause()
+
+
+def act_pair():
+    cfg = load_config(required=False)
+    print("Pair this Pi with a PiPulse Hub. You need the hub's address and its token")
+    print("(the part after ?t= in the hub's  + Add a Pi  command).\n")
+    host = ask("Hub address (IP or name)", cfg["hub"])
+    port = ask("Hub client-link port", str(cfg["port"]))
+    token = ask("Token", cfg["token"])
+    if not (host and port.isdigit() and token):
+        print("Cancelled.")
+        return pause()
+    try:
+        fp = peer_fingerprint(host, port)
+    except OSError as e:
+        print(f"Cannot reach https://{host}:{port}: {e}")
+        return pause()
+    print(f"\nThe hub presents this certificate fingerprint:\n  {fmt_fp(fp)}")
+    print("Compare it with Settings > Encrypted client link on the hub's dashboard.")
+    if ask("Does it match? (yes/no)", "no").lower() not in ("y", "yes"):
+        print("Not paired. Nothing was changed.")
+        return pause()
+    try:
+        Link(host, port, token, fp).request("GET", "/client.py")
+    except Exception as e:
+        print(f"The hub rejected that token: {e}")
+        return pause()
+    save_config(cfg | {"hub": host, "port": int(port), "token": token, "pin": fp})
+    run(["systemctl", "restart", "pipulse-client"])
+    print("Paired. The client restarted and now reports over the encrypted link.")
+    pause()
+
+
+def act_update():
+    cfg = load_config(required=False)
+    try:
+        new = Link(cfg["hub"], cfg["port"], cfg["token"], cfg["pin"]).request("GET", "/client.py")
+        compile(new, "client.py", "exec")
+    except Exception as e:
+        print(f"Could not fetch the client from the hub: {e}")
+        return pause()
+    m = re.search(rb'^VERSION = "([^"]+)"', new, re.M)
+    newv = m.group(1).decode() if m else "?"
+    if newv == VERSION:
+        print(f"Already up to date ({VERSION}).")
+        return pause()
+    me = os.path.abspath(__file__)
+    with open(me + ".new", "wb") as f:
+        f.write(new)
+    os.chmod(me + ".new", 0o755)
+    os.replace(me + ".new", me)
+    run(["systemctl", "restart", "pipulse-client"])
+    print(f"Updated {VERSION} -> {newv} and restarted. Reopen this menu to use the new version.")
+    pause()
+    sys.exit(0)
+
+
+def act_log():
+    subprocess.run(["journalctl", "-u", "pipulse-client", "-n", "40", "--no-pager", "-o", "short-iso"])
+    pause()
+
+
+def act_restart():
+    code, out = run(["systemctl", "restart", "pipulse-client"])
+    print("Restarted." if code == 0 else f"Restart failed: {out}")
+    pause()
+
+
+def act_uninstall():
+    if ask("Remove the PiPulse Client from this Pi? (yes/no)", "no").lower() not in ("y", "yes"):
+        return
+    run(["systemctl", "disable", "--now", "pipulse-client"])
+    for f in ("/etc/systemd/system/pipulse-client.service", CONFIG, "/usr/local/bin/pipulse", STATUS):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    run(["systemctl", "daemon-reload"])
+    print("Removed. (Delete /opt/pipulse-client to remove this program file too.)")
+    sys.exit(0)
+
+
+MENU = [("Status", act_status), ("Test the connection to the hub", act_test),
+        ("Pair with a hub (encryption)", act_pair), ("Update this client from the hub", act_update),
+        ("Show the recent log", act_log), ("Restart the client", act_restart),
+        ("Uninstall the client", act_uninstall), ("Quit", None)]
+
+
+def pick(stdscr):
+    import curses
+    curses.curs_set(0)
+    sel = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        head = status_lines()
+        for i, line in enumerate(head):
+            stdscr.addnstr(i + 1, 2, line, max(1, w - 4), curses.A_BOLD if i == 0 else 0)
+        top = len(head) + 2
+        for i, (label, _) in enumerate(MENU):
+            if top + i < h - 1:
+                stdscr.addnstr(top + i, 4, f" {i + 1}. {label} ", max(1, w - 6), curses.A_REVERSE if i == sel else 0)
+        if top + len(MENU) + 1 < h:
+            stdscr.addnstr(top + len(MENU) + 1, 2, "Up/down + Enter, or a number. q quits.", max(1, w - 4))
+        k = stdscr.getch()
+        if k in (curses.KEY_UP, ord("k")):
+            sel = (sel - 1) % len(MENU)
+        elif k in (curses.KEY_DOWN, ord("j")):
+            sel = (sel + 1) % len(MENU)
+        elif k in (10, 13, curses.KEY_ENTER):
+            return sel
+        elif k in (ord("q"), 27):
+            return len(MENU) - 1
+        elif ord("1") <= k < ord("1") + len(MENU):
+            return k - ord("1")
+
+
+def menu():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__), "--menu"])
+    while True:
+        try:
+            # Arrow-key menu only on a real terminal. curses on a pipe grabs the input
+            # meant for the numbered fallback.
+            if not (sys.stdin.isatty() and sys.stdout.isatty()) or os.environ.get("TERM") in (None, "", "dumb"):
+                raise RuntimeError("no terminal")
+            import curses
+            choice = curses.wrapper(pick)
+        except Exception:  # no curses or a dumb terminal: plain numbered menu
+            print("\n".join(status_lines()) + "\n")
+            for i, (label, _) in enumerate(MENU, 1):
+                print(f"  {i}. {label}")
+            v = ask("Choose")
+            choice = int(v) - 1 if v.isdigit() and 1 <= int(v) <= len(MENU) else len(MENU) - 1
+        fn = MENU[choice][1]
+        if fn is None:
+            return
+        print()
+        fn()
+
+
+def main():
+    if "--menu" in sys.argv:
+        return menu()
+    if "--once" in sys.argv:
+        sampler = Sampler()
+        sampler.sample()
+        time.sleep(1)
+        return print(json.dumps(dict(info=static_info(), **sampler.sample()), indent=1))
+    if "--check" in sys.argv:
+        cfg = load_config()
+        try:
+            v = json.loads(Link(cfg["hub"], cfg["port"], cfg["token"], cfg["pin"]).request("GET", "/api/ping"))["version"]
+            print("hub reachable, certificate matches the pin, version", v)
+        except Exception as e:
+            sys.exit(f"cannot talk to the hub: {e}")
+        return
+    serve()
 
 
 if __name__ == "__main__":

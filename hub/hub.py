@@ -13,11 +13,13 @@ Windows for development.
 import argparse
 import collections
 import getpass
+import gzip
 import hashlib
 import hmac
 import io
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
@@ -32,8 +34,11 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alerts as alerting  # noqa: E402
+import guards as guarding  # noqa: E402
 import tls  # noqa: E402
-from store import DEFAULTS, LIMITS, Store  # noqa: E402
+from nas import Nas  # noqa: E402
+from store import DEFAULTS, LIMITS, PATHS, Store  # noqa: E402
+from updater import REPO, Updater  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 BASE = ROOT.parent
@@ -101,20 +106,48 @@ def client_source():
 
 
 def bundle():
-    """The hub (with the client it hands out) as a tarball, laid out like the repo."""
+    """The hub (with the client it hands out) as a tarball, laid out like the repo.
+    Deterministic (fixed gzip header time, file mtimes from disk), so SHA256SUMS
+    served for it stays valid across requests."""
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as t:
-        t.add(BASE / "VERSION", "VERSION")
-        for f in sorted(ROOT.iterdir()):
-            if f.suffix in (".py", ".sh"):
-                t.add(f, f"hub/{f.name}")
-        for f in sorted(STATIC.iterdir()):
-            if f.is_file():
-                t.add(f, f"hub/static/{f.name}")
-        for f in sorted(CLIENT.iterdir()):
-            if f.suffix in (".py", ".sh"):
-                t.add(f, f"client/{f.name}")
+    files = [(BASE / "VERSION", "VERSION")]
+    if (BASE / "CHANGELOG.md").exists():
+        files.append((BASE / "CHANGELOG.md", "CHANGELOG.md"))
+    files += [(f, f"hub/{f.name}") for f in sorted(ROOT.iterdir()) if f.suffix in (".py", ".sh")]
+    files += [(f, f"hub/static/{f.name}") for f in sorted(STATIC.iterdir()) if f.is_file()]
+    files += [(f, f"client/{f.name}") for f in sorted(CLIENT.iterdir()) if f.suffix in (".py", ".sh")]
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as t:
+        for path, name in files:
+            info = t.gettarinfo(str(path), name)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            info.mode = 0o755 if name.endswith(".sh") else 0o644
+            with open(path, "rb") as f:
+                t.addfile(info, f)
+        repo = f"{REPO}\n".encode()
+        info = tarfile.TarInfo("REPO")
+        info.size, info.mode = len(repo), 0o644
+        t.addfile(info, io.BytesIO(repo))
     return buf.getvalue()
+
+
+UNIT_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+\.(service|scope)$")
+
+
+def os_name():
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip('"')
+    except OSError:
+        pass
+    import platform  # noqa: PLC0415 (only needed off-Pi)
+    return platform.platform()
+
+
+def dur_text(s):
+    d, h, m = int(s // 86400), int(s % 86400 // 3600), int(s % 3600 // 60)
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m {int(s % 60)}s"
 
 
 def fmt_fp(fp):
@@ -141,6 +174,10 @@ class Hub:
             hist = self.store.history(n["id"], 3600, 240)["points"]
             self.live[n["id"]]["recent"].extend([p[0], p[1], p[3], p[5]] for p in hist)
         self.store.rollup(time.time() - self.store.settings["raw_days"] * 86400)
+        self.version = VERSION
+        self.nas = Nas(self)
+        self.updater = Updater(self)
+        self.guards = guarding.Guards(self.store)
         self.store.add_event(None, "info", "hub", f"hub {VERSION} started")
 
     @property
@@ -149,8 +186,17 @@ class Hub:
 
     def fresh(self, n):
         return {"id": n["id"], "label": n.get("label", ""), "hostname": n.get("hostname", ""),
-                "info": n.get("info", {}), "seen": n.get("last_seen") or 0, "last": None,
-                "recent": collections.deque(maxlen=RECENT), "pending": [], "sent": {}}
+                "info": n.get("info", {}), "prefs": n.get("prefs") or {}, "seen": n.get("last_seen") or 0,
+                "last": None, "recent": collections.deque(maxlen=RECENT), "pending": [], "sent": {},
+                "restarts": {}, "gave_up": set(), "power_at": 0}
+
+    def queue(self, n, action, text):
+        action["id"], action["text"] = secrets.token_hex(4), text
+        n["pending"].append(action)
+        self.store.add_event(n["id"], "info", "action", "queued: " + text)
+        if action["type"] in ("reboot", "shutdown"):
+            n["power_at"] = time.time()
+        return action["id"]
 
     def name(self, n):
         return n["label"] or n["hostname"] or n["id"]
@@ -189,6 +235,8 @@ class Hub:
             "alerts": self.alerts.active(n["id"]) or ([] if n["last"] else [["warn", "waiting for first report"]]),
             "hist": list(n["recent"]), "pending": len(n["pending"]) + len(n["sent"]),
             "client_version": client_v, "outdated": bool(client_v) and client_v != VERSION,
+            "apt": (n["last"] or {}).get("apt"), "watch_status": (n["last"] or {}).get("watch") or {},
+            "prefs": n["prefs"],
         }
 
     # --- client reports
@@ -200,6 +248,13 @@ class Hub:
             if not n:
                 n = self.live[nid] = self.fresh({"id": nid})
                 self.store.add_event(nid, "info", "node", f"new Pi: {r.get('hostname')}")
+            old_boot, new_boot = (n["info"] or {}).get("boot_id"), (r.get("info") or {}).get("boot_id")
+            if old_boot and new_boot and old_boot != new_boot:
+                up = dur_text(r["metrics"].get("uptime") or 0)
+                if now - n["power_at"] < 900:
+                    self.store.add_event(nid, "info", "node", f"rebooted from the dashboard (up {up})")
+                else:
+                    self.store.add_event(nid, "warn", "node", f"rebooted, not from PiPulse (up {up})")
             if n["hostname"] != r.get("hostname") or n["info"] != r.get("info") or not n["last"]:
                 n["hostname"], n["info"] = r.get("hostname", nid), r.get("info", {})
                 self.store.upsert_node(nid, n["hostname"], n["info"], now)
@@ -214,10 +269,17 @@ class Hub:
                 "load1": (m.get("load") or [None])[0],
                 "disk": round(100 * root["used"] / root["total"], 1) if root else None,
                 "rx": (m.get("net") or {}).get("rx"), "tx": (m.get("net") or {}).get("tx"),
+                "wr": (m.get("disk_io") or {}).get("write"), "rtt": m.get("rtt"),
             }
             self.store.add_sample(nid, now, vals)
             n["recent"].append([round(now), vals["cpu"], vals["mem"], vals["temp"]])
-            self.alerts.update(nid, self.name(n), alerting.conditions(m, n["info"], self.store.settings), now)
+            watched = r.get("watch") or {}
+            found = alerting.conditions(m, n["info"], self.store.settings) | alerting.watch_conditions(watched)
+            self.alerts.update(nid, self.name(n), found, now)
+            self.watchdog(n, watched, now)
+            for action, text in self.guards.check(nid, r.get("services") or [], now):
+                self.queue(n, action, text)
+                self.store.add_event(nid, "warn", "guard", text)
             for res in r.get("results", []):
                 a = n["sent"].pop(res.get("id"), {"text": "action"})
                 ok = res.get("ok")
@@ -230,12 +292,34 @@ class Hub:
             actions, n["pending"] = n["pending"], []
             for a in actions:
                 n["sent"][a["id"]] = {"text": a["text"], "at": now}
-        return {"interval": self.store.settings["interval"],
+        return {"interval": self.store.settings["interval"], "watch": sorted((n["prefs"].get("watch") or {})),
                 "actions": [{k: v for k, v in a.items() if k != "text"} for a in actions]}
+
+    def watchdog(self, n, watched, now):
+        """Restart watched services that stopped, if the user allowed it. At most
+        once every 2 minutes and 3 times an hour per service, then give up and say so."""
+        prefs = n["prefs"].get("watch") or {}
+        for unit, state in watched.items():
+            if state in alerting.OK_STATES:
+                n["gave_up"].discard(unit)
+                continue
+            if not (prefs.get(unit) or {}).get("restart") or state not in ("failed", "inactive"):
+                continue
+            tries = [t for t in n["restarts"].get(unit, []) if now - t < 3600]
+            n["restarts"][unit] = tries
+            if tries and now - tries[-1] < 120:
+                continue
+            if len(tries) >= 3:
+                if unit not in n["gave_up"]:
+                    n["gave_up"].add(unit)
+                    self.store.add_event(n["id"], "error", "watchdog", f"gave up restarting {unit}: 3 tries in the last hour")
+                continue
+            tries.append(now)
+            self.queue(n, {"type": "restart", "unit": unit}, f"watchdog: restart {unit} ({state})")
 
     # --- background upkeep
     def maintain(self):
-        last_flush = last_roll = last_prune = time.time()
+        last_flush = last_roll = time.time()
         while True:
             time.sleep(5)
             now = time.time()
@@ -256,9 +340,8 @@ class Hub:
                 if now - last_roll >= 300:
                     self.store.rollup(now - 3 * 3600)
                     last_roll = now
-                if now - last_prune >= 3600:
-                    self.store.prune()
-                    last_prune = now
+                self.nas.due(now)       # archive + prune hourly, mirror, nightly backup (own thread)
+                self.updater.due(now)   # daily release check; picks up update results
             except Exception as e:  # keep the loop alive; the log says what broke
                 print(f"maintenance error: {e!r}", flush=True)
 
@@ -290,6 +373,12 @@ def clean_action(a, n):
         return {"type": "restart", "unit": str(a["unit"])}, f"restart {a['unit']}"
     if kind == "update":
         return {"type": "update", "sha256": hashlib.sha256(client_source()).hexdigest()}, f"update client to {VERSION}"
+    if kind in ("reboot", "shutdown"):
+        return {"type": kind}, "reboot the Pi" if kind == "reboot" else "shut the Pi down"
+    if kind == "apt_upgrade":
+        return {"type": "apt_upgrade"}, "install OS updates (apt upgrade)"
+    if kind == "apt_check":
+        return {"type": "apt_check"}, "check for OS updates"
     raise ValueError(f"unknown action {kind!r}")
 
 
@@ -428,6 +517,8 @@ class WebHandler(Base):
             return self.send(200, (ROOT / "uninstall.sh").read_bytes(), "text/plain")
         if path == "/hub/pipulse-hub.tar.gz":
             return self.send(200, bundle(), "application/gzip")
+        if path == "/hub/SHA256SUMS":
+            return self.send(200, f"{hashlib.sha256(bundle()).hexdigest()}  pipulse-hub.tar.gz\n", "text/plain")
 
         if path.startswith("/api/"):
             if not self.authed():
@@ -446,14 +537,25 @@ class WebHandler(Base):
             with hub.lock:
                 nodes = [hub.summary(n, now) for n in hub.live.values()]
             return self.send(200, {"now": now, "version": VERSION, "hostname": socket.gethostname(),
-                                   "nodes": nodes, "install": self.install_cmd()})
+                                   "nodes": nodes, "install": self.install_cmd(),
+                                   "update_available": hub.updater.available()})
         if path == "/api/settings":
             return self.send(200, {
-                "settings": store.public_settings(), "defaults": DEFAULTS, "limits": LIMITS,
+                "settings": store.public_settings(), "defaults": DEFAULTS, "limits": LIMITS, "paths": PATHS,
                 "version": VERSION, "hostname": socket.gethostname(), "started": hub.started,
                 "fingerprint": fmt_fp(hub.fp), "link_port": hub.link_port, "web_port": hub.web_port,
                 "db": store.size(), "data": str(hub.data), "install": self.install_cmd(),
                 "hub_install": f"curl -fsSL '{self.web_base()}/hub/install.sh' | sudo sh",
+                "protected": sorted(guarding.PROTECTED),
+            })
+        if path == "/api/nas":
+            return self.send(200, hub.nas.view())
+        if path == "/api/about":
+            return self.send(200, {
+                "version": VERSION, "update": hub.updater.view(), "hostname": socket.gethostname(),
+                "os": os_name(), "python": sys.version.split()[0], "started": hub.started,
+                "data": str(hub.data), "db": store.size(), "repo": REPO,
+                "changelog": (BASE / "CHANGELOG.md").read_text(encoding="utf-8") if (BASE / "CHANGELOG.md").exists() else "",
             })
         if path == "/api/events":
             rows = store.events(q.get("node") or None, q.get("level") or None, q.get("q") or None,
@@ -523,11 +625,37 @@ class WebHandler(Base):
                 store.add_event(None, "info", "auth", "dashboard password changed")
                 return self.send(200, {"ok": True}, headers=[self.new_session()])
             if path == "/api/settings":
-                changes = self.body()
-                store.update_settings(changes)
-                store.add_event(None, "info", "settings",
-                                "settings changed: " + ", ".join(f"{k}={store.settings[k]}" for k in changes))
+                changed = store.update_settings(self.body())
+                if changed:
+                    store.add_event(None, "info", "settings",
+                                    "settings changed: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
                 return self.send(200, {"ok": True, "settings": store.public_settings()})
+            if path == "/api/guards":
+                rules = guarding.validate(self.body().get("guards", []))
+                store.put("guards", rules)
+                store.add_event(None, "info", "settings", f"guard rules saved ({len(rules)})")
+                return self.send(200, {"ok": True, "guards": rules})
+            if path in ("/api/nas/mirror", "/api/nas/backup", "/api/nas/archive"):
+                job = path.rsplit("/", 1)[1]
+                if not hub.nas.start(job):
+                    return self.send(409, {"error": f"another NAS job is running ({hub.nas.running})"})
+                store.add_event(None, "info", "nas", f"{job} started from the dashboard")
+                return self.send(200, {"ok": True})
+            if path == "/api/update/check":
+                hub.updater.check()
+                return self.send(200, {"ok": True})
+            if path == "/api/update/hub":
+                return self.send(200, {"ok": True, "version": hub.updater.request()})
+            if path == "/api/update/clients":
+                queued = []
+                with hub.lock:
+                    for n in hub.live.values():
+                        s = hub.summary(n, time.time())
+                        if s["online"] and s["outdated"] and not any(a["type"] == "update" for a in n["pending"]):
+                            a, text = clean_action({"type": "update"}, n)
+                            hub.queue(n, a, text)
+                            queued.append(hub.name(n))
+                return self.send(200, {"ok": True, "queued": queued})
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "node"]:
                 with hub.lock:
@@ -536,14 +664,28 @@ class WebHandler(Base):
                         return self.send(404, {"error": "no such Pi"})
                     if parts[4] == "action":
                         a, text = clean_action(self.body(), n)
-                        a["id"], a["text"] = secrets.token_hex(4), text
-                        n["pending"].append(a)
-                        store.add_event(n["id"], "info", "action", "queued: " + text)
-                        return self.send(200, {"ok": True, "id": a["id"]})
+                        return self.send(200, {"ok": True, "id": hub.queue(n, a, text)})
                     if parts[4] == "label":
                         n["label"] = str(self.body().get("label", ""))[:60]
                         store.set_label(n["id"], n["label"])
                         return self.send(200, {"ok": True})
+                    if parts[4] == "watch":
+                        b = self.body()
+                        unit, on = str(b.get("unit", "")), bool(b.get("watch"))
+                        if not UNIT_RE.match(unit):
+                            raise ValueError("not a service name")
+                        watch = dict(n["prefs"].get("watch") or {})
+                        if on:
+                            watch[unit] = {"restart": bool(b.get("restart"))}
+                        else:
+                            watch.pop(unit, None)
+                            hub.alerts.update(n["id"], hub.name(n), {}, time.time(), only={f"svc:{unit}"})
+                        n["prefs"] = n["prefs"] | {"watch": watch}
+                        store.set_prefs(n["id"], n["prefs"])
+                        store.add_event(n["id"], "info", "watchdog",
+                                        (f"watching {unit}" + (" (auto-restart)" if watch[unit]["restart"] else ""))
+                                        if on else f"stopped watching {unit}")
+                        return self.send(200, {"ok": True, "prefs": n["prefs"]})
             self.send(404, {"error": "not found"})
         except (ValueError, KeyError, TypeError) as e:
             self.send(400, {"error": str(e)})

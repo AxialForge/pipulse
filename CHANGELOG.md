@@ -2,6 +2,27 @@
 
 All notable changes to PiPulse. Format: [Keep a Changelog](https://keepachangelog.com).
 
+## [0.4.0] - 2026-09-25
+
+### Added
+- **NAS storage.** `sudo pipulse-hub nas` mounts the NAS share on the hub Pi. Then:
+  - Every hour the database is mirrored to `Local_APP_Tank\PiPulse\pipulse-live.db`.
+  - Data past the history limits is archived there as daily `.csv.gz` files instead of deleted, so the NAS keeps everything.
+  - Every night a backup goes to `Backup_Pool\PiPulse Backup`: the database plus the hub's certificate and key, keeping the last 30.
+  - `sudo pipulse-hub restore <file>` puts a backup back, and clients keep working.
+  - Nothing is written unless the share is really mounted, so a dropped mount can't fill the SD card.
+- **Updater.** The hub checks GitHub daily. **Update hub** on the new About page installs the new release after checking its SHA256SUMS. **Update all Pis** then updates every client over the encrypted link.
+- **About page**: version, update status, release notes, the changelog and hub details.
+- **Add a Pi over SSH**: a second tab builds `ssh -t user@pi "…"` lines for one or more Pis, to paste into your PC's terminal.
+- **`sudo pipulse` on every client Pi**: a menu to see status, test the connection, pair with a hub (check the certificate fingerprint), update, view the log, restart or uninstall.
+- **Service watchdog**: watch any service per Pi, get an alert if it stops, and optionally auto-restart it (at most 3 times an hour).
+- **Remote reboot and shutdown**, and **OS updates**: see waiting apt updates (with the security count) and install them from the dashboard. They run in their own systemd unit, outside the client's CPU and memory cap.
+- **Health**: disk-write rate and total since boot (SD wear), a read-only root filesystem alert, reboot detection ("rebooted, not from PiPulse"), and link latency to the hub. New History charts for disk writes and latency.
+- **Guard rules**: "if a service stays above X for Y minutes, cap it at Z", for all Pis or one. They never touch SSH, systemd's core services or PiPulse itself.
+
+### Changed
+- The hub tarball is byte-for-byte reproducible, so its checksum can be published and verified.
+
 ## [0.3.0] - 2026-09-25
 
 The first release, split into two programs.

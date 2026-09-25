@@ -23,11 +23,13 @@ curl -fsSL https://github.com/AxialForge/pipulse/releases/latest/download/instal
 ```
 
 It installs the `pipulse-hub` service (dashboard on port **8750**, encrypted client
-link on **8751**) and a client for the hub Pi itself. Then it prints the dashboard
-address. Open it and create your password.
+link on **8751**) and a client for the hub Pi itself. It also offers to connect the
+NAS (see below). Then it prints the dashboard address. Open it and create your password.
 
-Re-run the same line to upgrade. The database, password, token and certificate are
-kept, so existing clients keep working.
+**Updating:** the hub checks GitHub daily, and the **About** page shows **Update hub**
+when a release is out. Then **Update all Pis** brings every client along. Re-running
+the install line also upgrades. The database, password, token and certificate are
+kept, so clients keep working.
 
 ## Add a Pi
 
@@ -37,24 +39,68 @@ In the dashboard, click **+ Add a Pi**. It shows a command like:
 curl -fsSL 'http://<hub>:8750/client/install.sh?t=<token>' | sudo sh
 ```
 
-Run that on the new Pi, and it appears within about 10 seconds. Clients always
-install from your hub, so a client's version matches its hub. When the hub is
-upgraded, each Pi shows an **Update** button.
+Run that on the new Pi, and it appears within about 10 seconds. The dialog's
+**From your PC over SSH** tab builds `ssh -t user@pi "…"` lines instead, one per Pi
+address you type, to paste into PowerShell or a terminal on your PC.
+
+Clients always install from your hub, so a client's version matches its hub.
+
+On any client Pi, `sudo pipulse` opens a small menu with these options:
+- status
+- test the connection to the hub
+- pair with a hub, after checking its certificate fingerprint
+- update
+- recent log
+- restart
+- uninstall
 
 ## What you get
 
 - **Pis**: a card per Pi with CPU, RAM, temperature, disk, a one-hour sparkline and active alerts.
 - **Per-Pi detail**:
   - *Overview*: per-core CPU, disks, network, throttling and under-voltage flags.
-  - *History*: charts for 1 hour up to 1 year.
-  - *Services*: CPU and RAM per systemd service, with **Limit** and **Restart**.
+    **Health & updates** shows:
+    - disk writes, which wear out SD cards
+    - whether the root filesystem has gone read-only
+    - link latency to the hub
+    - waiting OS updates, with an **Install** button
+
+    There are also **Reboot** and **Shut down** buttons.
+  - *History*: charts for 1 hour up to 1 year, including disk writes and latency.
+  - *Services*: CPU and RAM per systemd service, with **Limit**, **Restart** and
+    **Watch**. A watched service alerts you if it stops, and can be auto-restarted
+    (at most 3 times an hour).
   - *Processes*: the busiest and biggest processes, with **Nice**.
   - *Events*.
 - **Events**: everything the hub has logged (alerts raised and cleared, actions,
   sign-ins, settings changes), filterable and searchable.
 - **Settings**: report interval, offline timeout, alert thresholds, how long a
-  problem must last before it alerts, history retention, the client-link
-  fingerprint and the password.
+  problem must last before it alerts, history retention, NAS storage and
+  backups, guard rules, the client-link fingerprint and the password.
+- **About**: version, updates, release notes, the changelog.
+- A Pi that reboots without PiPulse asking it to is logged ("rebooted, not from
+  PiPulse").
+
+## NAS storage and backups
+
+`sudo pipulse-hub nas` on the hub Pi mounts the NAS share at `/mnt/pipulse`. It
+asks for the NAS login once and offers to reuse Linewatch's. From then on:
+
+| What | Where (default) | When |
+|---|---|---|
+| Database mirror (`pipulse-live.db`) | `Local_APP_Tank\PiPulse` | every hour |
+| Archive of data past the history limits (daily `.csv.gz` files) | `Local_APP_Tank\PiPulse\archive` | hourly; nothing is ever lost |
+| Backup: database + hub certificate and key | `Backup_Pool\PiPulse Backup` | nightly at 3:00, newest 30 kept |
+
+The live database stays on the Pi. SQLite over SMB can corrupt, and logging
+would stop whenever the NAS sleeps. If the NAS is away, the hub keeps the data
+until it's back, for up to a week. Nothing is written unless the share really
+is mounted, so a dropped mount can't fill the SD card. Folders, times and
+retention are in Settings, which also has **Mirror now** and **Back up now**.
+
+Restore: `sudo pipulse-hub restore "/mnt/pipulse/Backup_Pool/PiPulse Backup/<file>"`.
+It moves the current data aside, not away, and clients carry on because the
+certificate comes back too.
 
 ### Keeping one program from starving a Pi
 
@@ -63,6 +109,10 @@ cap its memory, or lower its priority. systemd enforces these limits
 (`systemctl set-property`). They survive reboots and don't change the program
 itself. Near the memory cap the service is slowed down, and past it systemd
 restarts it instead of letting the whole Pi freeze.
+
+**Guard rules** (Settings) do this automatically: "if a service stays above 150%
+CPU for 5 minutes, cap it at 1 core". Each rule fires once per service and is
+logged. Rules never touch SSH, systemd's core services or PiPulse.
 
 ## Security
 
@@ -79,11 +129,16 @@ restarts it instead of letting the whole Pi freeze.
   `hub-cert.pem` and `hub-key.pem`. Otherwise every client needs reinstalling
   because its pin won't match.
 
-Forgot the password:
+The `pipulse-hub` command on the hub Pi has these subcommands:
 
-```
-sudo -u pipulse python3 /opt/pipulse-hub/hub/hub.py --data /var/lib/pipulse --set-password
-```
+| Command | What it does |
+|---|---|
+| `status` | Hub and local client service status |
+| `nas` | Connect (or reconnect) the NAS |
+| `restore FILE` | Restore a backup |
+| `set-password` | Reset a forgotten password |
+| `log` | Recent hub log |
+| `update-log` | Log of the last update from the dashboard |
 
 ## Remove
 
@@ -110,5 +165,4 @@ CI tests, packages and attaches `install-hub.sh`, `pipulse-hub.tar.gz`,
 ## Roadmap
 
 - Notifications: phone push (ntfy), Home Assistant (MQTT discovery), email.
-- Automatic guard rules ("if a service stays above X for Y minutes, limit it").
-- HTTPS for the dashboard.
+- HTTPS for the dashboard; per-client keys.

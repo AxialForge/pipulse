@@ -11,7 +11,13 @@ ntfy, Home Assistant and email plug in.
 NOTIFIERS = []
 
 # Conditions that alert at once instead of waiting for `sustain`.
-IMMEDIATE = {"offline", "undervolt", "throttled"}
+IMMEDIATE = {"offline", "undervolt", "throttled", "readonly"}
+OK_STATES = {"active", "reloading", "activating"}
+
+
+def watch_conditions(watch_status):
+    """Watched services that aren't running: {"svc:<unit>": (level, text)}."""
+    return {f"svc:{u}": ("crit", f"{u} is {st}") for u, st in (watch_status or {}).items() if st not in OK_STATES}
 
 
 def conditions(m, info, s):
@@ -47,6 +53,11 @@ def conditions(m, info, s):
             out["disk:" + d["mount"]] = ("crit", f"{d['mount']} {use:.0f}% full")
         elif use >= s["disk_warn"]:
             out["disk:" + d["mount"]] = ("warn", f"{d['mount']} {use:.0f}% full")
+    if m.get("root_ro"):
+        out["readonly"] = ("crit", "root filesystem is read-only (SD card trouble?)")
+    wr = (m.get("disk_io") or {}).get("write")
+    if s.get("write_warn") and wr is not None and wr * 60 / 1048576 > s["write_warn"]:
+        out["writes"] = ("warn", f"writing {wr * 60 / 1048576:.0f} MB/min to disk")
     cores = (info or {}).get("cores") or 1
     if m.get("load") and m["load"][1] > cores * s["load_warn"]:
         out["load"] = ("warn", f"load {m['load'][1]:.1f} on {cores} cores")

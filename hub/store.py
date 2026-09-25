@@ -2,14 +2,17 @@
 
 Raw samples are buffered in memory and flushed every 30 s. An SD card does not
 enjoy a commit every 5 s per Pi. Raw rows are rolled up into hourly rows that
-outlive them; retention for each tier comes from settings.
+outlive them. Retention for each tier comes from settings; nas.py archives rows
+to the NAS before they are pruned.
 """
 import json
+import os
 import sqlite3
+import sys
 import threading
 import time
 
-SCHEMA = 1
+ON_PI = sys.platform.startswith("linux")
 
 DEFAULTS = {
     "interval": 5,           # seconds between client reports
@@ -23,19 +26,34 @@ DEFAULTS = {
     "disk_warn": 90, "disk_crit": 95,    # % used
     "swap_warn": 50,                     # % used
     "load_warn": 1.5,                    # 5-min load per core
+    "write_warn": 0,                     # MB written per minute (SD wear); 0 = off
+    # NAS (nas.py). Empty path = that feature is off.
+    "nas_data_dir": "/mnt/pipulse/Local_APP_Tank/PiPulse" if ON_PI else "",
+    "nas_backup_dir": "/mnt/pipulse/Backup_Pool/PiPulse Backup" if ON_PI else "",
+    "mirror_hours": 1,       # snapshot the database to the NAS this often; 0 = off
+    "archive": 1,            # move data past retention to the NAS instead of deleting it
+    "backup_hour": 3,        # nightly backup at this hour (local time)
+    "backup_keep": 30,       # backups kept on the NAS
+    "update_check": 1,       # check GitHub for new releases daily
+    "guards": [],            # guard rules (guards.py); validated by set_guards
 }
-# key -> (min, max). Anything not listed here can't be set from the dashboard.
+# key -> (min, max). Anything not listed here (or in PATHS) can't be set from the dashboard.
 LIMITS = {
     "interval": (2, 300), "raw_days": (1, 90), "hourly_days": (7, 3650), "event_days": (7, 3650),
     "offline_after": (10, 3600), "sustain": (0, 3600),
     "temp_warn": (40, 100), "temp_crit": (40, 100), "mem_warn": (10, 100), "mem_crit": (10, 100),
     "disk_warn": (10, 100), "disk_crit": (10, 100), "swap_warn": (1, 100), "load_warn": (0.1, 20),
+    "write_warn": (0, 10000), "mirror_hours": (0, 24), "archive": (0, 1), "backup_hour": (0, 23),
+    "backup_keep": (1, 365), "update_check": (0, 1),
 }
-METRICS = ("cpu", "mem", "temp", "load1", "disk", "rx", "tx")
+PATHS = ("nas_data_dir", "nas_backup_dir")
+METRICS = ("cpu", "mem", "temp", "load1", "disk", "rx", "tx", "wr", "rtt")
+HOURLY = ("cpu", "cpu_max", "mem", "mem_max", "temp", "temp_max", "load1", "disk", "rx", "tx", "n", "wr", "rtt")
 
 
 class Store:
     def __init__(self, path):
+        self.path = path
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
@@ -68,12 +86,23 @@ class Store:
                 PRAGMA user_version = 1;
                 COMMIT;
             """)
+        if v < 2:  # 0.4: disk writes, link latency, per-Pi preferences (watched services)
+            self.db.executescript("""
+                BEGIN;
+                ALTER TABLE samples ADD COLUMN wr REAL;
+                ALTER TABLE samples ADD COLUMN rtt REAL;
+                ALTER TABLE hourly ADD COLUMN wr REAL;
+                ALTER TABLE hourly ADD COLUMN rtt REAL;
+                ALTER TABLE nodes ADD COLUMN prefs TEXT NOT NULL DEFAULT '{}';
+                PRAGMA user_version = 2;
+                COMMIT;
+            """)
 
     # ------------------------------------------------------------ settings
-    # Keys starting with "_" are secrets (token, password hash) and never leave the hub.
+    # Keys starting with "_" are secrets or internal state and never leave the hub.
 
     def _load_settings(self):
-        s = dict(DEFAULTS)
+        s = json.loads(json.dumps(DEFAULTS))
         for row in self.db.execute("SELECT key, value FROM settings"):
             s[row["key"]] = json.loads(row["value"])
         return s
@@ -89,6 +118,13 @@ class Store:
     def update_settings(self, changes):
         clean = {}
         for k, v in changes.items():
+            if k in PATHS:
+                v = str(v).strip()
+                if v and (len(v) > 300 or ".." in v.replace("\\", "/").split("/")
+                          or not (v.startswith("/") or v.startswith("\\\\") or v[1:3] in (":\\", ":/"))):
+                    raise ValueError(f"{k} must be an absolute folder path")
+                clean[k] = v
+                continue
             if k not in LIMITS:
                 raise ValueError(f"unknown setting {k}")
             lo, hi = LIMITS[k]
@@ -103,12 +139,14 @@ class Store:
         with self.lock:
             for k, v in clean.items():
                 self.put(k, v)
+        return clean
 
     # ------------------------------------------------------------ nodes
 
     def nodes(self):
         with self.lock:
-            return [dict(r) | {"info": json.loads(r["info"])} for r in self.db.execute("SELECT * FROM nodes")]
+            return [dict(r) | {"info": json.loads(r["info"]), "prefs": json.loads(r["prefs"])}
+                    for r in self.db.execute("SELECT * FROM nodes")]
 
     def upsert_node(self, nid, hostname, info, now):
         with self.lock:
@@ -123,6 +161,10 @@ class Store:
     def set_label(self, nid, label):
         with self.lock:
             self.db.execute("UPDATE nodes SET label = ? WHERE id = ?", (label, nid))
+
+    def set_prefs(self, nid, prefs):
+        with self.lock:
+            self.db.execute("UPDATE nodes SET prefs = ? WHERE id = ?", (json.dumps(prefs), nid))
 
     def delete_node(self, nid):
         with self.lock:
@@ -142,7 +184,8 @@ class Store:
                 return
             rows, self.buffer = self.buffer, []
             self.db.execute("BEGIN")
-            self.db.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self.db.executemany(f"INSERT INTO samples (node, ts, {', '.join(METRICS)}) VALUES "
+                                f"({', '.join('?' * (len(METRICS) + 2))})", rows)
             self.db.execute("COMMIT")
 
     def rollup(self, since):
@@ -150,10 +193,10 @@ class Store:
         start = int(since) // 3600 * 3600
         with self.lock:
             self.flush()
-            self.db.execute("""
-                INSERT OR REPLACE INTO hourly
+            self.db.execute(f"""
+                INSERT OR REPLACE INTO hourly (node, ts, {', '.join(HOURLY)})
                 SELECT node, ts / 3600 * 3600, avg(cpu), max(cpu), avg(mem), max(mem), avg(temp), max(temp),
-                       avg(load1), avg(disk), avg(rx), avg(tx), count(*)
+                       avg(load1), avg(disk), avg(rx), avg(tx), count(*), avg(wr), avg(rtt)
                 FROM samples WHERE ts >= ? GROUP BY node, ts / 3600""", (start,))
 
     def history(self, nid, seconds, points=400):
@@ -162,20 +205,19 @@ class Store:
         now = time.time()
         since = now - seconds
         self.flush()
+        cols = ("ts", "cpu", "cpu_max", "mem", "mem_max", "temp", "temp_max", "load1", "disk", "rx", "tx", "wr", "rtt")
         with self.lock:
             if seconds <= self.settings["raw_days"] * 86400:
                 bucket = max(1, int(seconds / points))
                 rows = self.db.execute(f"""
                     SELECT ts / {bucket} * {bucket} AS t, avg(cpu), max(cpu), avg(mem), max(mem), avg(temp), max(temp),
-                           avg(load1), avg(disk), avg(rx), avg(tx)
+                           avg(load1), avg(disk), avg(rx), avg(tx), avg(wr), avg(rtt)
                     FROM samples WHERE node = ? AND ts >= ? GROUP BY t ORDER BY t""", (nid, since)).fetchall()
                 res = "raw" if bucket <= self.settings["interval"] else f"{bucket}s"
             else:
-                rows = self.db.execute("""
-                    SELECT ts, cpu, cpu_max, mem, mem_max, temp, temp_max, load1, disk, rx, tx
-                    FROM hourly WHERE node = ? AND ts >= ? ORDER BY ts""", (nid, since)).fetchall()
+                rows = self.db.execute(f"SELECT {', '.join(cols)} FROM hourly WHERE node = ? AND ts >= ? ORDER BY ts",
+                                       (nid, since)).fetchall()
                 res = "hourly"
-        cols = ("ts", "cpu", "cpu_max", "mem", "mem_max", "temp", "temp_max", "load1", "disk", "rx", "tx")
         return {"resolution": res, "cols": cols,
                 "points": [[round(v, 2) if isinstance(v, float) else v for v in r] for r in rows]}
 
@@ -218,17 +260,37 @@ class Store:
             else:
                 self.db.execute("DELETE FROM sessions WHERE key = ?", (key,))
 
-    # ------------------------------------------------------------ housekeeping
+    # ------------------------------------------------------------ archive / housekeeping
 
-    def prune(self):
-        now = time.time()
-        s = self.settings
+    def rows_between(self, table, lo, hi):
+        """All rows of samples/hourly/events with lo <= ts < hi, oldest first."""
+        assert table in ("samples", "hourly", "events")
         with self.lock:
             self.flush()
-            self.db.execute("DELETE FROM samples WHERE ts < ?", (now - s["raw_days"] * 86400,))
-            self.db.execute("DELETE FROM hourly WHERE ts < ?", (now - s["hourly_days"] * 86400,))
-            self.db.execute("DELETE FROM events WHERE ts < ?", (now - s["event_days"] * 86400,))
-            self.db.execute("DELETE FROM sessions WHERE expires < ?", (now,))
+            cur = self.db.execute(f"SELECT * FROM {table} WHERE ts >= ? AND ts < ? ORDER BY ts", (lo, hi))
+            return [d[0] for d in cur.description], [tuple(r) for r in cur.fetchall()]
+
+    def oldest(self, table):
+        with self.lock:
+            r = self.db.execute(f"SELECT min(ts) FROM {table}").fetchone()
+        return r[0]
+
+    def delete_before(self, table, ts):
+        with self.lock:
+            self.flush()
+            self.db.execute(f"DELETE FROM {table} WHERE ts < ?", (ts,))
+
+    def drop_expired_sessions(self):
+        with self.lock:
+            self.db.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
+
+    def vacuum_into(self, path):
+        """A consistent single-file copy of the live database (safe while it's being written)."""
+        if os.path.exists(path):
+            os.remove(path)
+        with self.lock:
+            self.flush()
+            self.db.execute("VACUUM INTO ?", (str(path),))
 
     def size(self):
         with self.lock:
