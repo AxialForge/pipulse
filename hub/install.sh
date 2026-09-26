@@ -100,7 +100,7 @@ rm -f /tmp/pipulse-client-install.sh
 if ! grep -q " /mnt/pipulse cifs " /etc/fstab && [ -z "${PIPULSE_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then
   printf 'Connect the NAS now for log mirror/archive and nightly backups? [Y/n]: ' > /dev/tty
   read -r A < /dev/tty || A=n
-  case "$A" in n*|N*) echo "Skipped. Later:  sudo pipulse-hub nas" ;; *) sh /opt/pipulse-hub/hub/nas-setup.sh ;; esac
+  case "$A" in n*|N*) echo "Skipped. Later:  sudo pipulse-hub nas" ;; *) sh /opt/pipulse-hub/hub/nas-setup.sh || echo "NAS not connected (the hub works without it). Try again:  sudo pipulse-hub nas" ;; esac
 fi
 
 IP=$(hostname -I | awk '{print $1}')

@@ -2,6 +2,16 @@
 
 All notable changes to PiPulse. Format: [Keep a Changelog](https://keepachangelog.com).
 
+## [0.4.1] - 2026-09-25
+
+### Fixed
+- NAS setup took whatever was typed at the share prompt, so a username there
+  became a broken fstab entry ("mount.cifs: bad UNC"). It now only accepts a
+  `//server/share` address, and says to press Enter for the default. A bad
+  entry saved by 0.4.0 is asked for again instead of reused.
+- A failed NAS step no longer ends the hub install early. The hub works without
+  it, and the summary with the dashboard address is still printed.
+
 ## [0.4.0] - 2026-09-25
 
 ### Added

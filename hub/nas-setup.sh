@@ -16,11 +16,16 @@ ask() { printf '%s' "$1" > "$TTY"; read -r REPLY < "$TTY"; }
 
 command -v mount.cifs >/dev/null || { apt-get update -qq && apt-get install -y -qq cifs-utils; }
 
+DEFAULT_SHARE=//192.168.1.204/Apocrypha_Main_Pool
+valid_share() { case "$1" in //?*/?*) return 0 ;; *) return 1 ;; esac; }
 SHARE=$(awk -v m="$MOUNT" '$2==m && $3=="cifs" {print $1}' /etc/fstab)
-if [ -z "$SHARE" ]; then
-  ask "NAS share [//192.168.1.204/Apocrypha_Main_Pool]: "
-  SHARE=${REPLY:-//192.168.1.204/Apocrypha_Main_Pool}
-fi
+# A bad saved share (e.g. a username typed at this prompt in 0.4.0) is asked again, not reused.
+valid_share "$SHARE" || SHARE=""
+while [ -z "$SHARE" ]; do
+  ask "NAS share address, like //server/share. Press Enter for $DEFAULT_SHARE: "
+  SHARE=${REPLY:-$DEFAULT_SHARE}
+  valid_share "$SHARE" || { echo "  '$SHARE' isn't a share address; it must look like //192.168.1.204/ShareName (the login comes next)." > "$TTY"; SHARE=""; }
+done
 
 mkdir -p /etc/pipulse
 if [ ! -f "$CREDS" ]; then
@@ -44,7 +49,12 @@ mkdir -p "$MOUNT"
 if grep -qF " $MOUNT cifs " /etc/fstab; then sed -i "\| $MOUNT cifs |c\\$LINE" /etc/fstab; else echo "$LINE" >> /etc/fstab; fi
 systemctl daemon-reload
 mountpoint -q "$MOUNT" && umount "$MOUNT" || true
-mount "$MOUNT" || { echo "Mount failed. Check the login in $CREDS, then: dmesg | tail"; exit 1; }
+if ! mount "$MOUNT"; then
+  echo "Mount of $SHARE failed. Most often the NAS login is wrong:"
+  echo "  sudo rm $CREDS && sudo pipulse-hub nas     (asks for the login again)"
+  echo "Details: sudo dmesg | tail"
+  exit 1
+fi
 
 for d in "Local_APP_Tank/PiPulse" "Backup_Pool/PiPulse Backup"; do
   sudo -u pipulse mkdir -p "$MOUNT/$d" && sudo -u pipulse touch "$MOUNT/$d/.pipulse-write-test" \
