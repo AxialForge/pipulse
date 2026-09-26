@@ -11,7 +11,9 @@ case "$1" in
   restore)
     shift; exec sudo sh "$H/restore.sh" "$@" ;;
   set-password)
-    exec sudo -u pipulse python3 "$H/hub.py" --data /var/lib/pipulse --set-password ;;
+    # The running hub keeps accounts in memory and would write its old copy back over the file,
+    # so restart it right after the change.
+    sudo -u pipulse python3 "$H/hub.py" --data /var/lib/pipulse --set-password && sudo systemctl restart pipulse-hub ;;
   log)
     exec journalctl -u pipulse-hub -n 60 --no-pager ;;
   update-log)
@@ -22,7 +24,7 @@ pipulse-hub <command>
   status          hub and local client service status
   nas             connect (or reconnect) the NAS for mirror, archive and backups
   restore FILE    restore a backup .tar.gz (moves current data aside first)
-  set-password    reset the dashboard password
+  set-password    set or reset the dashboard's 'admin' password (signs it out elsewhere)
   log             recent hub log
   update-log      log of the last update from the dashboard
 EOF

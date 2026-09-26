@@ -1,0 +1,16 @@
+# Caddy site block for a Bracket app behind the home server's Caddy (tls internal).
+# Replace __SLUG__ and __PORT__; append to /etc/caddy/Caddyfile, then:
+#   sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# Both schemes are listed so a phone without the Caddy root certificate can still open the guest pages over http.
+
+http://__SLUG__.home, https://__SLUG__.home {
+    tls internal
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:__PORT__ {
+        flush_interval -1
+        transport http {
+            read_timeout 0
+            write_timeout 0
+        }
+    }
+}

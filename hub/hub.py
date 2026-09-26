@@ -2,8 +2,8 @@
 """PiPulse Hub: the home of the dashboard, settings, logging and alerts.
 
 Two listeners:
-  * dashboard  (HTTP, --port, default 8750): the web UI, its JSON API behind a
-    password, and the client/hub install scripts;
+  * dashboard  (HTTP, --port, default 8750): the web UI (the Bracket kit's renderer, served
+    through web.py's contract with accounts and roles), and the client/hub install scripts;
   * client link (HTTPS, --link-port, default port+1): where PiPulse Clients send
     reports. The certificate is the hub's own and every client pins its fingerprint.
 
@@ -27,7 +27,6 @@ import sys
 import tarfile
 import threading
 import time
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -36,40 +35,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alerts as alerting  # noqa: E402
 import guards as guarding  # noqa: E402
 import tls  # noqa: E402
+import web as web_mod  # noqa: E402
 from nas import Nas  # noqa: E402
 from store import DEFAULTS, LIMITS, PATHS, Store  # noqa: E402
 from updater import REPO, Updater  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 BASE = ROOT.parent
-STATIC = ROOT / "static"
+WEB_DIR = ROOT / "web"          # PiPulse's pages (app.js, terms.js, index.html)
 CLIENT = BASE / "client"
+KIT_DIR = BASE / "kit" / "renderer"   # the vendored Bracket kit, never edited here
 VERSION = (BASE / "VERSION").read_text().strip() if (BASE / "VERSION").exists() else "dev"
-SESSION_DAYS = 30
 RECENT = 720  # sparkline points kept in memory per Pi (one hour at 5 s)
 RANGES = {"1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000, "1y": 31536000}
-STATIC_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}
 
 
 # ---------------------------------------------------------------- helpers
-
-def hash_pw(pw, salt=None, rounds=200_000):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), rounds).hex()
-    return f"pbkdf2${rounds}${salt}${digest}"
-
-
-def check_pw(pw, stored):
-    try:
-        _, rounds, salt, digest = stored.split("$")
-        return hmac.compare_digest(hash_pw(pw, salt, int(rounds)).rsplit("$", 1)[1], digest)
-    except (ValueError, AttributeError):
-        return False
-
-
-def sid_key(cookie):
-    return hashlib.sha256(cookie.encode()).hexdigest()
-
 
 def lan_ip():
     # The default route can be a VPN tunnel (NordVPN hands out 10.5.x), so list every
@@ -114,7 +95,9 @@ def bundle():
     if (BASE / "CHANGELOG.md").exists():
         files.append((BASE / "CHANGELOG.md", "CHANGELOG.md"))
     files += [(f, f"hub/{f.name}") for f in sorted(ROOT.iterdir()) if f.suffix in (".py", ".sh")]
-    files += [(f, f"hub/static/{f.name}") for f in sorted(STATIC.iterdir()) if f.is_file()]
+    files += [(f, f"hub/web/{f.name}") for f in sorted(WEB_DIR.iterdir()) if f.is_file()]
+    files += [(BASE / "kit" / "VERSION", "kit/VERSION")]
+    files += [(f, f"kit/renderer/{f.name}") for f in sorted(KIT_DIR.iterdir()) if f.is_file()]
     files += [(f, f"client/{f.name}") for f in sorted(CLIENT.iterdir()) if f.suffix in (".py", ".sh")]
     with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as t:
         for path, name in files:
@@ -452,53 +435,38 @@ class LinkHandler(Base):
         return hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + self.hub.token)
 
 
-# ---------------------------------------------------------------- dashboard (HTTP)
+# ---------------------------------------------------------------- dashboard (HTTP, Bracket contract)
+
+def request_host(host_header):
+    """Host name from a Host header, with localhost swapped for the LAN address (a Pi can't use it)."""
+    host = host_header or "localhost"
+    if host.count(":") == 1:
+        host = host.split(":")[0]
+    return lan_ip() if host in ("localhost", "127.0.0.1", "[::1]") else host
+
 
 class WebHandler(Base):
-    def hub_host(self):
-        # A Pi can't use "localhost", so swap in this machine's LAN address.
-        host = self.headers.get("Host") or "localhost"
-        if host.count(":") == 1:
-            host = host.split(":")[0]
-        return lan_ip() if host in ("localhost", "127.0.0.1", "[::1]") else host
+    web: web_mod.Web = None
 
     def web_base(self):
-        return f"http://{self.hub_host()}:{self.hub.web_port}"
-
-    def install_cmd(self):
-        return f"curl -fsSL '{self.web_base()}/client/install.sh?t={self.hub.token}' | sudo sh"
-
-    # --- sessions
-    def cookie(self):
-        c = SimpleCookie(self.headers.get("Cookie", ""))
-        return c["pp"].value if "pp" in c else ""
-
-    def authed(self):
-        c = self.cookie()
-        return bool(c) and self.hub.store.session_ok(sid_key(c))
-
-    def new_session(self):
-        cookie = secrets.token_urlsafe(32)
-        self.hub.store.add_session(sid_key(cookie), time.time() + SESSION_DAYS * 86400)
-        return ("Set-Cookie", f"pp={cookie}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_DAYS * 86400}")
+        return f"http://{request_host(self.headers.get('Host'))}:{self.hub.web_port}"
 
     def do_GET(self):
         url = urlparse(self.path)
         path, q = url.path, {k: v[0] for k, v in parse_qs(url.query).items()}
-        hub, store = self.hub, self.hub.store
-        now = time.time()
-
+        hub = self.hub
+        if self.web.refused(self):
+            return self.send(403, {"ok": False, "error": "LAN only"})
         if path == "/api/ping":
             return self.send(200, {"ok": True, "version": VERSION})
-        if path == "/api/auth":
-            return self.send(200, {"setup": not store.settings.get("_password"), "authed": self.authed()})
-        # Install scripts and client code are not secret; install.sh still needs the token.
+        # Install scripts and client code are not secret; the client installer still needs the token.
         if path == "/client/install.sh":
             if not hmac.compare_digest(q.get("t", ""), hub.token):
                 return self.send(403, "echo 'PiPulse: wrong or missing token'; exit 1\n", "text/plain")
-            host = "127.0.0.1" if "local" in q else self.hub_host()
+            local = "local" in q
             script = (CLIENT / "install.sh").read_text()
-            for k, v in {"__HOST__": host, "__WEB__": self.web_base() if "local" not in q else f"http://127.0.0.1:{hub.web_port}",
+            for k, v in {"__HOST__": "127.0.0.1" if local else request_host(self.headers.get("Host")),
+                         "__WEB__": f"http://127.0.0.1:{hub.web_port}" if local else self.web_base(),
                          "__LINK_PORT__": str(hub.link_port), "__TOKEN__": hub.token, "__PIN__": hub.fp,
                          "__SHA256__": hashlib.sha256(client_source()).hexdigest(), "__VERSION__": VERSION}.items():
                 script = script.replace(k, v)
@@ -519,193 +487,243 @@ class WebHandler(Base):
             return self.send(200, bundle(), "application/gzip")
         if path == "/hub/SHA256SUMS":
             return self.send(200, f"{hashlib.sha256(bundle()).hexdigest()}  pipulse-hub.tar.gz\n", "text/plain")
-
-        if path.startswith("/api/"):
-            if not self.authed():
-                return self.send(401, {"error": "sign in"})
-            return self.api_get(path, q, now)
-
-        name = "index.html" if path == "/" else path.lstrip("/")
-        f = (STATIC / name).resolve()
-        if f.parent == STATIC.resolve() and f.is_file():
-            return self.send(200, f.read_bytes(), STATIC_TYPES.get(f.suffix, "application/octet-stream"))
-        self.send(404, {"error": "not found"})
-
-    def api_get(self, path, q, now):
-        hub, store = self.hub, self.hub.store
-        if path == "/api/state":
-            with hub.lock:
-                nodes = [hub.summary(n, now) for n in hub.live.values()]
-            return self.send(200, {"now": now, "version": VERSION, "hostname": socket.gethostname(),
-                                   "nodes": nodes, "install": self.install_cmd(),
-                                   "update_available": hub.updater.available()})
-        if path == "/api/settings":
-            return self.send(200, {
-                "settings": store.public_settings(), "defaults": DEFAULTS, "limits": LIMITS, "paths": PATHS,
-                "version": VERSION, "hostname": socket.gethostname(), "started": hub.started,
-                "fingerprint": fmt_fp(hub.fp), "link_port": hub.link_port, "web_port": hub.web_port,
-                "db": store.size(), "data": str(hub.data), "install": self.install_cmd(),
-                "hub_install": f"curl -fsSL '{self.web_base()}/hub/install.sh' | sudo sh",
-                "protected": sorted(guarding.PROTECTED),
-            })
-        if path == "/api/nas":
-            return self.send(200, hub.nas.view())
-        if path == "/api/about":
-            return self.send(200, {
-                "version": VERSION, "update": hub.updater.view(), "hostname": socket.gethostname(),
-                "os": os_name(), "python": sys.version.split()[0], "started": hub.started,
-                "data": str(hub.data), "db": store.size(), "repo": REPO,
-                "changelog": (BASE / "CHANGELOG.md").read_text(encoding="utf-8") if (BASE / "CHANGELOG.md").exists() else "",
-            })
-        if path == "/api/events":
-            rows = store.events(q.get("node") or None, q.get("level") or None, q.get("q") or None,
-                                q.get("before") or None, q.get("limit") or 100)
-            with hub.lock:
-                names = {i: hub.name(n) for i, n in hub.live.items()}
-            for r in rows:
-                r["name"] = names.get(r["node"], r["node"] or "hub")
-            return self.send(200, {"events": rows})
-        parts = path.split("/")
-        if len(parts) >= 4 and parts[2] == "node":
-            with hub.lock:
-                n = hub.live.get(parts[3])
-                if not n:
-                    return self.send(404, {"error": "no such Pi"})
-                if len(parts) == 5 and parts[4] == "history":
-                    secs = RANGES.get(q.get("range", "24h"))
-                    if not secs:
-                        return self.send(400, {"error": "range must be one of " + ", ".join(RANGES)})
-                    return self.send(200, store.history(n["id"], secs))
-                data = hub.summary(n, now) | {
-                    "procs": n["last"]["procs"] if n["last"] else [],
-                    "services": n["last"]["services"] if n["last"] else [],
-                    "events": store.events(n["id"], limit=50),
-                    "hub_version": VERSION,
-                }
-            return self.send(200, data)
-        self.send(404, {"error": "not found"})
+        if not self.web.get(self, path):
+            self.send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        hub, store = self.hub, self.hub.store
-        # JSON-only plus SameSite=Strict keeps other websites from posting forms here.
-        if "application/json" not in self.headers.get("Content-Type", ""):
-            return self.send(415, {"error": "JSON only"})
-        try:
-            if path == "/api/auth/setup":
-                pw = str(self.body().get("password", ""))
-                with hub.lock:
-                    if store.settings.get("_password"):
-                        return self.send(409, {"error": "a password is already set"})
-                    if len(pw) < 8:
-                        return self.send(400, {"error": "use at least 8 characters"})
-                    store.put("_password", hash_pw(pw))
-                store.add_event(None, "info", "auth", "dashboard password created")
-                return self.send(200, {"ok": True}, headers=[self.new_session()])
-            if path == "/api/auth/login":
-                if not check_pw(str(self.body().get("password", "")), store.settings.get("_password")):
-                    time.sleep(1)  # slows guessing without needing lockout state
-                    store.add_event(None, "warn", "auth", f"failed sign-in from {self.client_address[0]}")
-                    return self.send(401, {"error": "wrong password"})
-                return self.send(200, {"ok": True}, headers=[self.new_session()])
-            if not self.authed():
-                return self.send(401, {"error": "sign in"})
-            if path == "/api/auth/logout":
-                store.drop_session(sid_key(self.cookie()))
-                return self.send(200, {"ok": True}, headers=[("Set-Cookie", "pp=; Path=/; Max-Age=0")])
-            if path == "/api/password":
-                b = self.body()
-                if not check_pw(str(b.get("current", "")), store.settings.get("_password")):
-                    time.sleep(1)
-                    return self.send(403, {"error": "current password is wrong"})
-                if len(str(b.get("new", ""))) < 8:
-                    return self.send(400, {"error": "use at least 8 characters"})
-                store.put("_password", hash_pw(str(b["new"])))
-                store.drop_session()  # sign out every other browser
-                store.add_event(None, "info", "auth", "dashboard password changed")
-                return self.send(200, {"ok": True}, headers=[self.new_session()])
-            if path == "/api/settings":
-                changed = store.update_settings(self.body())
-                if changed:
-                    store.add_event(None, "info", "settings",
-                                    "settings changed: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
-                return self.send(200, {"ok": True, "settings": store.public_settings()})
-            if path == "/api/guards":
-                rules = guarding.validate(self.body().get("guards", []))
-                store.put("guards", rules)
-                store.add_event(None, "info", "settings", f"guard rules saved ({len(rules)})")
-                return self.send(200, {"ok": True, "guards": rules})
-            if path in ("/api/nas/mirror", "/api/nas/backup", "/api/nas/archive"):
-                job = path.rsplit("/", 1)[1]
-                if not hub.nas.start(job):
-                    return self.send(409, {"error": f"another NAS job is running ({hub.nas.running})"})
-                store.add_event(None, "info", "nas", f"{job} started from the dashboard")
-                return self.send(200, {"ok": True})
-            if path == "/api/update/check":
-                hub.updater.check()
-                return self.send(200, {"ok": True})
-            if path == "/api/update/hub":
-                return self.send(200, {"ok": True, "version": hub.updater.request()})
-            if path == "/api/update/clients":
-                queued = []
-                with hub.lock:
-                    for n in hub.live.values():
-                        s = hub.summary(n, time.time())
-                        if s["online"] and s["outdated"] and not any(a["type"] == "update" for a in n["pending"]):
-                            a, text = clean_action({"type": "update"}, n)
-                            hub.queue(n, a, text)
-                            queued.append(hub.name(n))
-                return self.send(200, {"ok": True, "queued": queued})
-            parts = path.split("/")
-            if len(parts) == 5 and parts[1:3] == ["api", "node"]:
-                with hub.lock:
-                    n = hub.live.get(parts[3])
-                    if not n:
-                        return self.send(404, {"error": "no such Pi"})
-                    if parts[4] == "action":
-                        a, text = clean_action(self.body(), n)
-                        return self.send(200, {"ok": True, "id": hub.queue(n, a, text)})
-                    if parts[4] == "label":
-                        n["label"] = str(self.body().get("label", ""))[:60]
-                        store.set_label(n["id"], n["label"])
-                        return self.send(200, {"ok": True})
-                    if parts[4] == "watch":
-                        b = self.body()
-                        unit, on = str(b.get("unit", "")), bool(b.get("watch"))
-                        if not UNIT_RE.match(unit):
-                            raise ValueError("not a service name")
-                        watch = dict(n["prefs"].get("watch") or {})
-                        if on:
-                            watch[unit] = {"restart": bool(b.get("restart"))}
-                        else:
-                            watch.pop(unit, None)
-                            hub.alerts.update(n["id"], hub.name(n), {}, time.time(), only={f"svc:{unit}"})
-                        n["prefs"] = n["prefs"] | {"watch": watch}
-                        store.set_prefs(n["id"], n["prefs"])
-                        store.add_event(n["id"], "info", "watchdog",
-                                        (f"watching {unit}" + (" (auto-restart)" if watch[unit]["restart"] else ""))
-                                        if on else f"stopped watching {unit}")
-                        return self.send(200, {"ok": True, "prefs": n["prefs"]})
-            self.send(404, {"error": "not found"})
-        except (ValueError, KeyError, TypeError) as e:
-            self.send(400, {"error": str(e)})
+        if self.web.refused(self):
+            return self.send(403, {"ok": False, "error": "LAN only"})
+        if not self.web.post(self, urlparse(self.path).path, {"port": self.hub.web_port}):
+            self.send(404, {"ok": False, "error": "not found"})
 
-    def do_DELETE(self):
-        if not self.authed():
-            return self.send(401, {"error": "sign in"})
-        parts = urlparse(self.path).path.split("/")
-        if len(parts) == 4 and parts[1:3] == ["api", "node"]:
-            with self.hub.lock:
-                n = self.hub.live.pop(parts[3], None)
-                self.hub.alerts.forget(parts[3])
-                self.hub.store.delete_node(parts[3])
-                if n:
-                    self.hub.store.add_event(None, "info", "node", f"forgot {self.hub.name(n)}")
-            return self.send(200, {"ok": True})
-        self.send(404, {"error": "not found"})
+
+# ---------------------------------------------------------------- PiPulse channels
+
+ROLES = {
+    # Guests (only if an admin turns guest access on): the read-only fleet overview.
+    "GUEST": ["fleet:state", "pi:get", "pi:history"],
+    # Standard accounts: every page read-only. No install command (it carries the token).
+    "STANDARD": ["fleet:state", "pi:get", "pi:history", "events:list", "hub:settings", "nas:view", "hubupdate:view"],
+    # Admins may call everything; these ask for the password again (valid 5 minutes).
+    "SENSITIVE": ["pi:power", "pi:forget", "hubupdate:hub", "hub:setSettings"],
+}
+
+
+def register_channels(web, hub):
+    h = web.handler
+    store = hub.store
+
+    def install_cmd(ctx):
+        return f"curl -fsSL 'http://{request_host(ctx['host'])}:{hub.web_port}/client/install.sh?t={hub.token}' | sudo sh"
+
+    def node(nid):
+        n = hub.live.get(str(nid))
+        if not n:
+            raise ValueError("no such Pi")
+        return n
+
+    @h("app:info")
+    def app_info():
+        return {"version": VERSION, "kit": (BASE / "kit" / "VERSION").read_text().strip() if (BASE / "kit" / "VERSION").exists() else None,
+                "node": f"not used (the hub is Python {sys.version.split()[0]})", "python": sys.version.split()[0], "web": True, "https": False, "platform": os_name(),
+                "hostname": socket.gethostname(), "cpus": os.cpu_count(), "dataDir": str(hub.data), "repo": f"https://github.com/{REPO}",
+                "db": {"size": store.size()["bytes"], **{k: v for k, v in store.size().items() if k != "bytes"}},
+                "name": "PiPulse", "slug": "pipulse"}
+
+    @h("update:check")
+    def update_check():
+        hub.updater.check_now()
+        u = hub.updater.view()
+        if u["latest"].get("error"):
+            return {"state": "error", "message": f"Could not check GitHub: {u['latest']['error']}"}
+        if u["available"]:
+            return {"state": "available", "version": u["available"], "message": f"PiPulse {u['available']} is available. Install it below."}
+        return {"state": "current", "version": VERSION, "message": f"You are on the latest version ({VERSION})."}
+
+    @h("sys:stats")
+    def sys_stats():
+        return {"health": {"level": "ok", "reasons": []}, "sampleMs": 5000}
+
+    @h("fleet:state")
+    def fleet_state():
+        now = time.time()
+        with hub.lock:
+            nodes = [hub.summary(n, now) for n in hub.live.values()]
+        return {"now": now, "version": VERSION, "hostname": socket.gethostname(), "nodes": nodes,
+                "update_available": hub.updater.available()}
+
+    @h("fleet:install", ctx=True)
+    def fleet_install(ctx):
+        return {"command": install_cmd(ctx), "web_port": hub.web_port, "link_port": hub.link_port,
+                "uninstall": f"curl -fsSL http://{request_host(ctx['host'])}:{hub.web_port}/client/uninstall.sh | sudo sh"}
+
+    @h("pi:get")
+    def pi_get(nid):
+        with hub.lock:
+            n = node(nid)
+            return hub.summary(n, time.time()) | {
+                "procs": n["last"]["procs"] if n["last"] else [], "services": n["last"]["services"] if n["last"] else [],
+                "events": store.events(n["id"], limit=60), "hub_version": VERSION}
+
+    @h("pi:history")
+    def pi_history(nid, rng="24h"):
+        secs = RANGES.get(rng)
+        if not secs:
+            raise ValueError("range must be one of " + ", ".join(RANGES))
+        with hub.lock:
+            n = node(nid)
+        return store.history(n["id"], secs)
+
+    def act(nid, action):
+        with hub.lock:
+            n = node(nid)
+            a, text = clean_action(action or {}, n)
+            return {"ok": True, "id": hub.queue(n, a, text)}
+
+    @h("pi:action")
+    def pi_action(nid, action=None):
+        if (action or {}).get("type") in ("reboot", "shutdown"):
+            raise ValueError("use pi:power for reboot and shutdown")
+        return act(nid, action)
+
+    @h("pi:power")
+    def pi_power(nid, kind=None):
+        if kind not in ("reboot", "shutdown"):
+            raise ValueError("kind must be reboot or shutdown")
+        return act(nid, {"type": kind})
+
+    @h("pi:label")
+    def pi_label(nid, label=""):
+        with hub.lock:
+            n = node(nid)
+            n["label"] = str(label or "")[:60]
+            store.set_label(n["id"], n["label"])
+        return True
+
+    @h("pi:watch")
+    def pi_watch(nid, unit="", watch=True, restart=False):
+        unit = str(unit)
+        if not UNIT_RE.match(unit):
+            raise ValueError("not a service name")
+        with hub.lock:
+            n = node(nid)
+            w = dict(n["prefs"].get("watch") or {})
+            if watch:
+                w[unit] = {"restart": bool(restart)}
+            else:
+                w.pop(unit, None)
+                hub.alerts.update(n["id"], hub.name(n), {}, time.time(), only={f"svc:{unit}"})
+            n["prefs"] = n["prefs"] | {"watch": w}
+            store.set_prefs(n["id"], n["prefs"])
+            store.add_event(n["id"], "info", "watchdog", (f"watching {unit}" + (" (auto-restart)" if w[unit]["restart"] else ""))
+                            if watch else f"stopped watching {unit}")
+            return n["prefs"]
+
+    @h("pi:forget")
+    def pi_forget(nid):
+        with hub.lock:
+            n = hub.live.pop(str(nid), None)
+            hub.alerts.forget(str(nid))
+            store.delete_node(str(nid))
+            if n:
+                store.add_event(None, "info", "node", f"forgot {hub.name(n)}")
+        return True
+
+    @h("events:list")
+    def events_list(q=None):
+        q = q or {}
+        rows = store.events(q.get("node") or None, q.get("level") or None, q.get("q") or None, q.get("before") or None, q.get("limit") or 100)
+        with hub.lock:
+            names = {i: hub.name(n) for i, n in hub.live.items()}
+        for r in rows:
+            r["name"] = names.get(r["node"], r["node"] or "hub")
+        return rows
+
+    @h("hub:settings")
+    def hub_settings():
+        return {"settings": store.public_settings(), "defaults": DEFAULTS, "limits": LIMITS, "paths": PATHS,
+                "fingerprint": fmt_fp(hub.fp), "link_port": hub.link_port, "web_port": hub.web_port,
+                "db": store.size(), "data": str(hub.data), "protected": sorted(guarding.PROTECTED), "started": hub.started}
+
+    @h("hub:setSettings")
+    def hub_set_settings(changes=None):
+        changed = store.update_settings(changes or {})
+        if changed:
+            store.add_event(None, "info", "settings", "settings changed: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
+        return store.public_settings()
+
+    @h("hub:guards")
+    def hub_guards(rules=None):
+        rules = guarding.validate(rules or [])
+        store.put("guards", rules)
+        store.add_event(None, "info", "settings", f"guard rules saved ({len(rules)})")
+        return rules
+
+    @h("nas:view")
+    def nas_view():
+        return hub.nas.view()
+
+    @h("nas:run")
+    def nas_run(job=None):
+        if job not in ("mirror", "backup", "archive"):
+            raise ValueError("job must be mirror, backup or archive")
+        if not hub.nas.start(job):
+            raise ValueError(f"another NAS job is running ({hub.nas.running})")
+        store.add_event(None, "info", "nas", f"{job} started from the dashboard")
+        return True
+
+    @h("hubupdate:view")
+    def hubupdate_view():
+        return hub.updater.view() | {"changelog": (BASE / "CHANGELOG.md").read_text(encoding="utf-8") if (BASE / "CHANGELOG.md").exists() else ""}
+
+    @h("hubupdate:check")
+    def hubupdate_check():
+        hub.updater.check()
+        return True
+
+    @h("hubupdate:hub")
+    def hubupdate_hub():
+        return hub.updater.request()
+
+    @h("hubupdate:clients")
+    def hubupdate_clients():
+        queued = []
+        with hub.lock:
+            for n in hub.live.values():
+                s = hub.summary(n, time.time())
+                if s["online"] and s["outdated"] and not any(a["type"] == "update" for a in n["pending"]):
+                    a, text = clean_action({"type": "update"}, n)
+                    hub.queue(n, a, text)
+                    queued.append(hub.name(n))
+        return queued
+
+
+def fleet_status(hub):
+    """/api/status?key=…: a compact fleet summary for Home Assistant REST sensors."""
+    now = time.time()
+    with hub.lock:
+        nodes = [hub.summary(n, now) for n in hub.live.values()]
+    pis = {}
+    for s in nodes:
+        m = s["metrics"] or {}
+        mem = m.get("mem") or {}
+        pis[s["label"] or s["hostname"] or s["id"]] = {
+            "online": s["online"], "cpu": m.get("cpu"), "temp": m.get("temp"),
+            "mem": round(100 * (1 - mem["avail"] / mem["total"]), 1) if mem.get("total") else None,
+            "alerts": [a[1] for a in s["alerts"]], "client": s["client_version"]}
+    return {"ok": True, "app": "PiPulse", "version": VERSION, "online": sum(1 for s in nodes if s["online"]), "total": len(nodes),
+            "alerts": sum(len(s["alerts"]) for s in nodes), "pis": pis}
 
 
 # ---------------------------------------------------------------- main
+
+def make_web(hub):
+    web = web_mod.Web(meta={"name": "PiPulse", "slug": "pipulse"}, data=hub.data, renderer=WEB_DIR, kit=KIT_DIR,
+                      version=VERSION, roles=ROLES, status_fn=lambda: fleet_status(hub),
+                      log=lambda s: print(s, flush=True), legacy_hash=hub.store.settings.get("_password"))
+    register_channels(web, hub)
+    return web
+
 
 def main():
     ap = argparse.ArgumentParser(description="PiPulse Hub")
@@ -713,23 +731,32 @@ def main():
     ap.add_argument("--link-port", type=int, help="encrypted client link port (default: port + 1)")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--data", default=str(ROOT / "data"), help="data directory")
-    ap.add_argument("--set-password", action="store_true", help="set the dashboard password and exit")
+    ap.add_argument("--set-password", action="store_true", help="create or reset the 'admin' account and exit")
+    ap.add_argument("--if-no-account", action="store_true", help="with --set-password: only when no account exists yet")
     args = ap.parse_args()
     data = Path(args.data)
 
     if args.set_password:
         data.mkdir(parents=True, exist_ok=True)
         store = Store(str(data / "pipulse.db"))
-        pw = getpass.getpass("New dashboard password: ")
-        if len(pw) < 8 or pw != getpass.getpass("Again: "):
-            sys.exit("Passwords must match and be at least 8 characters.")
-        store.put("_password", hash_pw(pw))
-        store.drop_session()
-        store.add_event(None, "info", "auth", "dashboard password reset from the command line")
-        return print("Password set. Every browser has been signed out.")
+        web = web_mod.Web(meta={"name": "PiPulse", "slug": "pipulse"}, data=data, renderer=WEB_DIR, kit=KIT_DIR, version=VERSION,
+                          roles=ROLES, legacy_hash=store.settings.get("_password"))
+        if args.if_no_account and web.has_users():
+            return print("An account already exists; keeping it.")
+        pw = os.environ.get("PIPULSE_PASSWORD") or getpass.getpass("Password for the 'admin' account (8+ characters): ")
+        if not os.environ.get("PIPULSE_PASSWORD") and pw != getpass.getpass("Again: "):
+            sys.exit("The two passwords differ.")
+        try:
+            web.set_password(pw)
+        except ValueError as e:
+            sys.exit(str(e))
+        store.add_event(None, "info", "auth", "admin password set from the command line")
+        return print("Saved. Sign in as 'admin'. If the hub is running, restart it now (sudo systemctl restart pipulse-hub);\n"
+                     "pipulse-hub set-password does that for you.")
 
     hub = Hub(data, args.port, args.link_port or args.port + 1)
     Base.hub = hub
+    WebHandler.web = make_web(hub)
     web = QuietServer((args.bind, hub.web_port), WebHandler)
     link = QuietServer((args.bind, hub.link_port), LinkHandler)
     link.socket = tls.server_context(hub.cert, hub.key).wrap_socket(

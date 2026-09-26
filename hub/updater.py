@@ -48,36 +48,43 @@ class Updater:
         v = self.latest.get("version")
         return v if v and vtuple(v) > vtuple(self.hub.version) else None
 
+    def check_now(self):
+        """Ask GitHub now and wait for the answer (the About page's "Check for updates")."""
+        if not self.checking:
+            self.checking = True
+            self._fetch(quiet=False)
+
     def check(self, quiet=False):
         """Ask GitHub for the latest release (in a thread). Records the result in settings."""
         if self.checking:
             return
         self.checking = True
+        threading.Thread(target=self._fetch, args=(quiet,), daemon=True).start()
 
-        def work():
-            try:
-                req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
-                                             headers={"Accept": "application/vnd.github+json",
-                                                      "User-Agent": f"PiPulse-Hub/{self.hub.version}"})
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    rel = json.load(r)
-                before = self.available()
-                self.store.put("_latest", {
-                    "version": rel["tag_name"].lstrip("v"), "notes": rel.get("body") or "",
-                    "url": rel.get("html_url"), "published": rel.get("published_at"),
-                    "checked": time.time(), "error": None})
-                now = self.available()
-                if now and now != before:
-                    self.store.add_event(None, "info", "update", f"PiPulse {now} is available")
-            except Exception as e:
-                if getattr(e, "code", None) == 404:
-                    e = "no release published on GitHub yet"
-                self.store.put("_latest", self.latest | {"checked": time.time(), "error": str(e)})
-                if not quiet:
-                    self.store.add_event(None, "warn", "update", f"update check failed: {e}")
-            finally:
-                self.checking = False
-        threading.Thread(target=work, daemon=True).start()
+    def _fetch(self, quiet):
+        """Ask GitHub for the latest release and record it (or the error) in settings."""
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                         headers={"Accept": "application/vnd.github+json",
+                                                  "User-Agent": f"PiPulse-Hub/{self.hub.version}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                rel = json.load(r)
+            before = self.available()
+            self.store.put("_latest", {
+                "version": rel["tag_name"].lstrip("v"), "notes": rel.get("body") or "",
+                "url": rel.get("html_url"), "published": rel.get("published_at"),
+                "checked": time.time(), "error": None})
+            now = self.available()
+            if now and now != before:
+                self.store.add_event(None, "info", "update", f"PiPulse {now} is available")
+        except Exception as e:
+            if getattr(e, "code", None) == 404:
+                e = "no release published on GitHub yet"
+            self.store.put("_latest", self.latest | {"checked": time.time(), "error": str(e)})
+            if not quiet:
+                self.store.add_event(None, "warn", "update", f"update check failed: {e}")
+        finally:
+            self.checking = False
 
     def due(self, now):
         if self.store.settings["update_check"] and now - self.latest.get("checked", 0) > 86400:

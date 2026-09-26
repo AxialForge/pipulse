@@ -28,7 +28,8 @@ if fetch "$SRC/SHA256SUMS" "$TMP/SHA256SUMS" 2>/dev/null; then
   (cd "$TMP" && grep ' pipulse-hub.tar.gz$' SHA256SUMS | sha256sum -c --quiet -) \
     || { echo "pipulse-hub.tar.gz failed its checksum; not installing."; rm -rf "$TMP"; exit 1; }
 fi
-rm -rf /opt/pipulse-hub/hub /opt/pipulse-hub/client
+# Replaced whole on every install or upgrade; the kit is Bracket's renderer, vendored.
+rm -rf /opt/pipulse-hub/hub /opt/pipulse-hub/client /opt/pipulse-hub/kit
 tar -xzf "$TMP/pipulse-hub.tar.gz" -C /opt/pipulse-hub --no-same-owner
 rm -rf "$TMP"
 chown -R pipulse:pipulse /var/lib/pipulse
@@ -96,6 +97,19 @@ fetch "http://127.0.0.1:$PORT/client/install.sh?t=$TOKEN&local=1" /tmp/pipulse-c
 sh /tmp/pipulse-client-install.sh >/dev/null
 rm -f /tmp/pipulse-client-install.sh
 
+# Dashboard account: on a fresh interactive install, make the admin now. (Otherwise the first
+# visit to the dashboard creates it. PiPulse 0.4's password carries over as "admin".)
+HAS_ACCOUNT=$(python3 -c 'import json; print(1 if json.load(open("/var/lib/pipulse/web.json")).get("users") else 0)' 2>/dev/null || echo 0)
+if [ "$HAS_ACCOUNT" = 0 ] && [ -z "${PIPULSE_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then
+  printf 'Create the dashboard admin account now? [Y/n]: ' > /dev/tty
+  read -r A < /dev/tty || A=n
+  case "$A" in
+    n*|N*) echo "Skipped: the first visit to the dashboard creates it." ;;
+    *) sudo -u pipulse python3 /opt/pipulse-hub/hub/hub.py --data /var/lib/pipulse --set-password --if-no-account < /dev/tty \
+         && systemctl restart pipulse-hub ;;
+  esac
+fi
+
 # NAS storage (mirror, archive, backups): offered once, on an interactive install.
 if ! grep -q " /mnt/pipulse cifs " /etc/fstab && [ -z "${PIPULSE_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then
   printf 'Connect the NAS now for log mirror/archive and nightly backups? [Y/n]: ' > /dev/tty
@@ -106,6 +120,6 @@ fi
 IP=$(hostname -I | awk '{print $1}')
 echo
 echo "PiPulse Hub $(cat /opt/pipulse-hub/VERSION) is running, and this Pi is being monitored."
-echo "  Dashboard:     http://$IP:$PORT   (first visit: create your password)"
+echo "  Dashboard:     http://$IP:$PORT   (sign in as admin; behind Caddy: https://pipulse.home)"
 echo "  Client link:   port $LINK, encrypted. Add Pis from  + Add a Pi."
-echo "  Commands:      pipulse-hub (NAS, restore, password)   sudo pipulse (this Pi's client menu)"
+echo "  Commands:      pipulse-hub (NAS, restore, set-password)   sudo pipulse (this Pi's client menu)"

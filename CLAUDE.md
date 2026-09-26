@@ -6,7 +6,8 @@ hosts the dashboard, settings, SQLite logging and alerts. **PiPulse Client**
 an encrypted, certificate-pinned link. It also applies service limits, renices,
 restarts, reboots, installs OS updates and updates itself when the hub asks. The
 hub mirrors, archives and backs up to the user's NAS, and updates itself from
-GitHub releases. It is a small-fleet home tool (a handful of Pis), not Prometheus:
+GitHub releases. The dashboard is a **Bracket app**: the vendored Bracket kit's renderer
+(`kit/renderer`) in front of `hub/web.py`, a stdlib port of Bracket's Python adapter. It is a small-fleet home tool (a handful of Pis), not Prometheus:
 no agents to configure, no time-series server, no cloud.
 
 ## Non-negotiables
@@ -38,6 +39,14 @@ no agents to configure, no time-series server, no cloud.
   ProtectSystem=strict. It writes `update/request.json`, and the root
   `pipulse-hub-updater.path` unit runs `hub/update.sh`. That script verifies the
   release's SHA256SUMS before running `install-hub.sh`.
+- **`kit/` is Bracket's, vendored whole and never edited here.** Upgrade it with
+  `node tools/kit-upgrade.js --from ../Bracket --apply`. A change the kit needs goes into
+  AxialForge/bracket first (a new kit version), then comes back through an upgrade. PiPulse's look
+  lives in `hub/web/app.css` on top of `kit.css`.
+- **The dashboard contract is Bracket's**: `hub/web/bridge-shape.js` lists every channel;
+  `tests/test_web.py` fails when a channel is listed but not served, or served but not listed.
+  Security defaults from the kit don't loosen: LAN-only on, guest off, re-auth for SENSITIVE,
+  cookie `pipulse_session`.
 - One version for both programs: `VERSION`. The hub stamps it into `client.py`
   when serving it, and `tools/package.py` does the same for releases.
 
@@ -66,7 +75,9 @@ python tools/package.py                 # dist/ release assets
 | `hub/install.sh`, `hub/uninstall.sh` | Pi hub installer (`__SRC__`/`__PORT__` filled by the serving hub or by package.py; env `PIPULSE_PORT`, `PIPULSE_NONINTERACTIVE`) |
 | `hub/update.sh` | Root updater, run by `pipulse-hub-updater.service` from a copy in /run |
 | `hub/nas-setup.sh`, `hub/restore.sh`, `hub/pipulse-hub.sh` | NAS mount + credentials + remount timer; restore a backup; the `pipulse-hub` command |
-| `hub/static/` | Dashboard: `index.html`, `app.js` (hash routes `#pis`/`#events`/`#settings`/`#about`), `style.css` |
+| `hub/web.py` | The Bracket contract on http.server: accounts/roles/sessions/lockout/LAN-only/re-auth/audit (`web.json`), kit channels, static files, SSE, `/api/status` |
+| `hub/web/` | The pages: `index.html`, `app-meta.js`, `bridge-shape.js` (the contract), `app.js` (views `pis`, `pi/<id>/<tab>`, `events`, `add`, `settings`; kit `security`, `about`), `terms.js` (glossary), `app.css`, `logo.svg` |
+| `kit/` | Bracket kit, vendored whole (0.2.0). Only `kit/renderer` + `kit/VERSION` ship in the hub tarball |
 | `client/client.py` | `Link` (pinned HTTPS), `Sampler`, `Apt`, `Watch`, actions, report loop, `--menu` (curses, with a numbered fallback) / `--check` / `--once` |
 | `client/install.sh`, `client/uninstall.sh` | Client installer (also `/usr/local/bin/pipulse`); the hub fills host, ports, token, pin and sha256 |
 | `tools/demo.py`, `tools/package.py` | Fake Pis (reboots, apt, watchdog crash) and backfill; release packaging |
@@ -85,6 +96,14 @@ own client uses `127.0.0.1` (`install.sh?...&local=1`).
 payload and an event text. Add it to `do_action()` in client.py and validate it
 again there. Add it to demo.py's action loop and give it a button in app.js that
 calls `act({...})`.
+
+**A new dashboard channel.** Add the leaf to `hub/web/bridge-shape.js`, register it in
+`register_channels()` in hub.py with `@h("group:name")` (`ctx=True` for the request context), and
+put it in `ROLES` (GUEST/STANDARD/SENSITIVE) if it isn't admin-only. `tests/test_web.py` checks
+the three agree.
+
+**A new term.** Add it to `hub/web/terms.js` and mark it with `T('key', 'label')` in app.js.
+`tests/test_terms.py` checks every marked key exists and every `[[link]]` resolves.
 
 **A new setting.** Add it to `DEFAULTS` and `LIMITS` in store.py (or `PATHS`
 for a folder), then add a field to `SETTING_GROUPS` in app.js. The fifth element
@@ -121,6 +140,14 @@ for any secrets.
   token can contain `__`. Check the named placeholders instead.
 - Clearing a limit sets empty values (`CPUQuota=`). The `50-*.conf` drop-ins stay
   behind but hold nothing. That's systemd, not a bug.
+- **webbridge.js URL-encodes the channel** (`/api/fleet%3Astate`). The first build compared the
+  raw path and every call answered "unknown channel fleet%3Astate". `Web.post` unquotes it.
+- **Card headings are flex boxes**, so the space between a glossary term and the text after it
+  collapsed ("CLIENT& POWER"). Wrap mixed heading text in one `<span>`.
+- **The CLI password reset and the running hub share `web.json`.** The hub keeps accounts in
+  memory and saves them back (session last-seen, every minute), overwriting a reset made from
+  the shell. `pipulse-hub set-password` restarts the hub; the installer does too after creating
+  the account.
 - **Two `.tabs` navs on one page.** The Add-a-Pi dialog got tabs, came earlier
   in the DOM, and `$('.tabs')` silently bound the Pi dialog's handler to it, so
   the Pi tabs stopped switching. The Pi tabs are `#nodeTabs` now. Select by ID.

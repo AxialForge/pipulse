@@ -25,7 +25,7 @@ import guards  # noqa: E402
 import hub as hubmod  # noqa: E402
 from nas import Nas, check_dir  # noqa: E402
 from store import Store  # noqa: E402
-from test_link import HubTest, report  # noqa: E402
+from test_link import ApiError, HubTest, report  # noqa: E402
 
 
 class NasTest(unittest.TestCase):
@@ -170,16 +170,15 @@ class HubFeatureTest(HubTest):
 
     def test_watchdog_alerts_and_restarts(self):
         self.link.request("POST", "/api/report", report("wd01"))
-        self.call("/api/settings", {"sustain": 0})
-        self.call("/api/node/wd01/watch", {"unit": "app.service", "watch": True, "restart": True})
+        self.call("hub:setSettings", {"sustain": 0})
+        self.call("pi:watch", "wd01", "app.service", True, True)
         reply = json.loads(self.link.request("POST", "/api/report", report("wd01")))
         self.assertEqual(reply["watch"], ["app.service"])
         body = json.loads(report("wd01"))
         body["watch"] = {"app.service": "failed"}
         reply = json.loads(self.link.request("POST", "/api/report", json.dumps(body).encode()))
         self.assertEqual([(a["type"], a["unit"]) for a in reply["actions"]], [("restart", "app.service")])
-        node = next(n for n in self.call("/api/state")["nodes"] if n["id"] == "wd01")
-        self.assertIn(["crit", "app.service is failed"], node["alerts"])
+        self.assertIn(["crit", "app.service is failed"], self.node("wd01")["alerts"])
         # Still failed on the next report: no second restart within 2 minutes.
         reply = json.loads(self.link.request("POST", "/api/report", json.dumps(body).encode()))
         self.assertEqual(reply["actions"], [])
@@ -189,21 +188,20 @@ class HubFeatureTest(HubTest):
             body = json.loads(report("rb01"))
             body["info"]["boot_id"] = boot
             self.link.request("POST", "/api/report", json.dumps(body).encode())
-        msgs = [e["msg"] for e in self.call("/api/events?node=rb01")["events"]]
+        msgs = [e["msg"] for e in self.call("events:list", {"node": "rb01"})]
         self.assertTrue(any(m.startswith("rebooted, not from PiPulse") for m in msgs), msgs)
 
     def test_path_settings_validated(self):
-        with self.assertRaises(urllib.error.HTTPError):
-            self.call("/api/settings", {"nas_data_dir": "relative/path"})
-        with self.assertRaises(urllib.error.HTTPError):
-            self.call("/api/settings", {"nas_data_dir": "/mnt/pipulse/../etc"})
-        self.assertEqual(self.call("/api/settings", {"nas_data_dir": ""})["settings"]["nas_data_dir"], "")
+        with self.assertRaises(ApiError):
+            self.call("hub:setSettings", {"nas_data_dir": "relative/path"})
+        with self.assertRaises(ApiError):
+            self.call("hub:setSettings", {"nas_data_dir": "/mnt/pipulse/../etc"})
+        self.assertEqual(self.call("hub:setSettings", {"nas_data_dir": ""})["nas_data_dir"], "")
 
     def test_about_and_update_not_managed(self):
-        about = self.call("/api/about")
-        self.assertFalse(about["update"]["managed"])
-        with self.assertRaises(urllib.error.HTTPError):
-            self.call("/api/update/hub", {})
+        self.assertFalse(self.call("hubupdate:view")["managed"])
+        with self.assertRaises(ApiError):
+            self.call("hubupdate:hub")
 
     def test_bundle_is_deterministic_and_matches_sums(self):
         a = urllib.request.urlopen(self.base + "/hub/pipulse-hub.tar.gz").read()
@@ -214,8 +212,10 @@ class HubFeatureTest(HubTest):
         import io
         with tarfile.open(fileobj=io.BytesIO(a)) as t:
             names = t.getnames()
-        for want in ("REPO", "VERSION", "hub/update.sh", "hub/nas-setup.sh", "hub/pipulse-hub.sh", "client/client.py"):
+        for want in ("REPO", "VERSION", "hub/update.sh", "hub/nas-setup.sh", "hub/pipulse-hub.sh", "hub/web.py", "client/client.py",
+                     "hub/web/index.html", "hub/web/app.js", "hub/web/terms.js", "kit/VERSION", "kit/renderer/ui.js", "kit/renderer/glossary.js"):
             self.assertIn(want, names)
+        self.assertFalse([n for n in names if n.startswith(("kit/main", "kit/server", "kit/electron"))], "only the kit's renderer ships")
 
 
 del HubTest  # imported only to subclass; don't run its tests twice

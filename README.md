@@ -23,8 +23,10 @@ curl -fsSL https://github.com/AxialForge/pipulse/releases/latest/download/instal
 ```
 
 It installs the `pipulse-hub` service (dashboard on port **8750**, encrypted client
-link on **8751**) and a client for the hub Pi itself. It also offers to connect the
-NAS (see below). Then it prints the dashboard address. Open it and create your password.
+link on **8751**) and a client for the hub Pi itself. It offers to create the dashboard's
+**admin** account and to connect the NAS (see below), then prints the dashboard address. If
+you skip the account, the first visit to the dashboard creates it. Behind Caddy, the dashboard
+is `https://pipulse.home`.
 
 **Updating:** the hub checks GitHub daily, and the **About** page shows **Update hub**
 when a release is out. Then **Update all Pis** brings every client along. Re-running
@@ -56,30 +58,31 @@ On any client Pi, `sudo pipulse` opens a small menu with these options:
 
 ## What you get
 
-- **Pis**: a card per Pi with CPU, RAM, temperature, disk, a one-hour sparkline and active alerts.
-- **Per-Pi detail**:
-  - *Overview*: per-core CPU, disks, network, throttling and under-voltage flags.
-    **Health & updates** shows:
-    - disk writes, which wear out SD cards
-    - whether the root filesystem has gone read-only
-    - link latency to the hub
-    - waiting OS updates, with an **Install** button
+The dashboard is a [Bracket](https://github.com/AxialForge/bracket) app, the same frame as
+MediaLedger and Linewatch: a sidebar, stat tiles, cards and eight colour themes.
 
-    There are also **Reboot** and **Shut down** buttons.
-  - *History*: charts for 1 hour up to 1 year, including disk writes and latency.
-  - *Services*: CPU and RAM per systemd service, with **Limit**, **Restart** and
-    **Watch**. A watched service alerts you if it stops, and can be auto-restarted
-    (at most 3 times an hour).
-  - *Processes*: the busiest and biggest processes, with **Nice**.
+- **Pis**: a row of tiles per Pi (health, CPU, memory, temperature, disk and link latency),
+  with a coloured edge on anything that needs attention. It refreshes every 5 seconds.
+- **A Pi's page**: more tiles (throttling, filesystem, disk writes, OS updates, network,
+  processes), then these tabs:
+  - *Overview*: CPU per core, memory, temperature, storage, OS updates with **Install**, and
+    **Reboot** / **Shut down**.
+  - *History*: charts from 1 hour to 1 year.
+  - *Services*: **Watch** (alert, optional auto-restart), **Limit** and **Restart**.
+  - *Processes*: with **Nice**.
   - *Events*.
-- **Events**: everything the hub has logged (alerts raised and cleared, actions,
-  sign-ins, settings changes), filterable and searchable.
-- **Settings**: report interval, offline timeout, alert thresholds, how long a
-  problem must last before it alerts, history retention, NAS storage and
-  backups, guard rules, the client-link fingerprint and the password.
-- **About**: version, updates, release notes, the changelog.
-- A Pi that reboots without PiPulse asking it to is logged ("rebooted, not from
-  PiPulse").
+- **Events**: everything the hub logged, filterable and searchable.
+- **Add a Pi**: the install command for one Pi, or SSH lines for several at once.
+- **Settings**: report interval, alert thresholds, history limits, NAS storage and backups, guard
+  rules, the client-link fingerprint, colour theme, and the Home Assistant status URL.
+- **Security**: accounts (admin / standard), sessions, LAN-only, guest view and the audit log.
+- **About**: versions, **Update hub**, **Update all Pis**, release notes, the changelog.
+
+**Definitions everywhere.** Words like *load average*, *swap*, *throttling* or *CPU cap* have a
+dotted underline. Hover for a one-line meaning, or click for a panel with the full explanation,
+what healthy looks like, what to do if it isn't, and related terms.
+
+A Pi that reboots without PiPulse asking it to is logged ("rebooted, not from PiPulse").
 
 ## NAS storage and backups
 
@@ -121,10 +124,19 @@ logged. Rules never touch SSH, systemd's core services or PiPulse.
   fingerprint at install. A client won't send anything to a hub whose certificate
   doesn't match. No certificate authority is involved, so nothing costs money or
   expires. Reports on the unencrypted dashboard port are refused.
-- The dashboard needs a password, which you create on first visit. Sessions last 30 days.
-- The dashboard itself is plain HTTP, so it's meant for your home network. To
-  reach it from outside, use your router's VPN (UniFi has WireGuard and Teleport
-  built in). Don't port-forward it.
+- The dashboard uses Bracket's security model:
+  - **admin** and **standard** accounts
+  - 30-day sessions
+  - lockout after 8 failed sign-ins
+  - LAN-only access
+  - guest view off
+  - the password asked again for reboot, shutdown, forgetting a Pi, settings changes and hub
+    updates
+  - an audit log on the Security page
+
+  0.4's single password became the **admin** account.
+- Open it through Caddy (`https://pipulse.home`) for HTTPS. Don't port-forward it; to reach it
+  from outside, use your router's VPN (UniFi has WireGuard and Teleport built in).
 - **Moving the hub to another Pi:** copy `/var/lib/pipulse` across, including
   `hub-cert.pem` and `hub-key.pem`. Otherwise every client needs reinstalling
   because its pin won't match.
@@ -136,7 +148,7 @@ The `pipulse-hub` command on the hub Pi has these subcommands:
 | `status` | Hub and local client service status |
 | `nas` | Connect (or reconnect) the NAS |
 | `restore FILE` | Restore a backup |
-| `set-password` | Reset a forgotten password |
+| `set-password` | Set or reset the admin password (restarts the hub) |
 | `log` | Recent hub log |
 | `update-log` | Log of the last update from the dashboard |
 
@@ -153,7 +165,11 @@ python tools/demo.py               # three fake Pis over the real encrypted link
 python tools/demo.py --backfill    # 30 days of fake history for them (restart the hub afterwards)
 python -m unittest discover tests  # end-to-end tests against a real hub process
 python tools/package.py            # release assets into dist/
+node tools/kit-upgrade.js --from ../Bracket   # show / --apply a newer Bracket kit into kit/
 ```
+
+The pages are in `hub/web/` (`app.js`, `terms.js` for the definitions). `kit/` is Bracket's kit,
+vendored whole and never edited here; the hub only ships its `renderer/`.
 
 A running dev hub can also install itself onto a Pi, which is handy before a release exists:
 `curl -fsSL http://<pc>:8750/hub/install.sh | sudo sh`.

@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -40,7 +41,16 @@ def report(nid="test01", cpu=12.5, **metrics):
                        "metrics": m, "procs": [], "services": []}).encode()
 
 
+class ApiError(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"{status}: {body.get('error')}")
+        self.status, self.body = status, body
+
+
 class HubTest(unittest.TestCase):
+    """A real hub process on free ports, signed in as the first admin through the kit contract."""
+    PASSWORD = "testpass123"
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -64,7 +74,7 @@ class HubTest(unittest.TestCase):
         cls.link = client.Link("127.0.0.1", cls.link_port, cls.token, cls.pin)
         cls.jar = http.cookiejar.CookieJar()
         cls.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cls.jar))
-        cls.call("/api/auth/setup", {"password": "testpass123"})
+        cls.post("/api/login", {"username": "admin", "password": cls.PASSWORD})  # first run: creates the admin
 
     @classmethod
     def tearDownClass(cls):
@@ -74,16 +84,26 @@ class HubTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     @classmethod
-    def call(cls, path, body=None, method=None):
-        req = urllib.request.Request(cls.base + path, None if body is None else json.dumps(body).encode(),
-                                     {"Content-Type": "application/json"}, method=method)
-        with cls.opener.open(req, timeout=10) as r:
-            return json.load(r)
+    def post(cls, path, body, opener=None):
+        req = urllib.request.Request(cls.base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        try:
+            with (opener or cls.opener).open(req, timeout=10) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, json.load(e)) from None
+
+    @classmethod
+    def call(cls, channel, *args, opener=None):
+        """One kit-contract call, as webbridge.js makes it: POST /api/<channel> with a JSON array."""
+        return cls.post("/api/" + urllib.parse.quote(channel, safe=""), list(args), opener)["result"]
+
+    def node(self, nid):
+        return next(n for n in self.call("fleet:state")["nodes"] if n["id"] == nid)
 
     def test_report_over_pinned_link(self):
         reply = json.loads(self.link.request("POST", "/api/report", report()))
         self.assertEqual(reply["interval"], 5)
-        node = next(n for n in self.call("/api/state")["nodes"] if n["id"] == "test01")
+        node = self.node("test01")
         self.assertTrue(node["online"])
         self.assertEqual(node["metrics"]["cpu"], 12.5)
 
@@ -91,7 +111,7 @@ class HubTest(unittest.TestCase):
         bad = client.Link("127.0.0.1", self.link_port, self.token, "ab" * 32)
         with self.assertRaises(client.PinMismatch):
             bad.request("POST", "/api/report", report("never"))
-        self.assertNotIn("never", [n["id"] for n in self.call("/api/state")["nodes"]])
+        self.assertNotIn("never", [n["id"] for n in self.call("fleet:state")["nodes"]])
 
     def test_wrong_token_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "401"):
@@ -105,35 +125,33 @@ class HubTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 401)
 
     def test_dashboard_needs_sign_in(self):
-        with self.assertRaises(urllib.error.HTTPError) as e:
-            urllib.request.urlopen(self.base + "/api/state", timeout=5)
-        self.assertEqual(e.exception.code, 401)
+        with self.assertRaises(ApiError) as e:
+            self.call("fleet:state", opener=urllib.request.build_opener())
+        self.assertEqual((e.exception.status, e.exception.body["reason"]), (401, "login"))
 
     def test_settings_validation(self):
-        with self.assertRaises(urllib.error.HTTPError) as e:
-            self.call("/api/settings", {"temp_warn": 90, "temp_crit": 80})
-        self.assertEqual(e.exception.code, 400)
-        self.assertEqual(self.call("/api/settings", {"sustain": 0})["settings"]["sustain"], 0)
+        with self.assertRaises(ApiError) as e:
+            self.call("hub:setSettings", {"temp_warn": 90, "temp_crit": 80})
+        self.assertEqual(e.exception.status, 400)
+        self.assertEqual(self.call("hub:setSettings", {"sustain": 0})["sustain"], 0)
 
     def test_alert_raised_and_logged(self):
-        self.call("/api/settings", {"sustain": 0})
+        self.call("hub:setSettings", {"sustain": 0})
         self.link.request("POST", "/api/report", report("hot01", temp=85.0))
-        node = next(n for n in self.call("/api/state")["nodes"] if n["id"] == "hot01")
-        self.assertIn(["crit", "hot: 85 °C"], node["alerts"])
+        self.assertIn(["crit", "hot: 85 °C"], self.node("hot01")["alerts"])
         self.link.request("POST", "/api/report", report("hot01", temp=50.0))
-        msgs = [e["msg"] for e in self.call("/api/events?node=hot01")["events"]]
+        msgs = [e["msg"] for e in self.call("events:list", {"node": "hot01"})]
         self.assertIn("hot: 85 °C", msgs)
         self.assertIn("cleared: hot: 85 °C", msgs)
 
     def test_history_recorded(self):
         self.link.request("POST", "/api/report", report("hist01", cpu=33.0))
-        h = self.call("/api/node/hist01/history?range=1h")
+        h = self.call("pi:history", "hist01", "1h")
         self.assertEqual(h["points"][-1][1], 33.0)
 
     def test_actions_round_trip(self):
         self.link.request("POST", "/api/report", report("act01"))
-        self.call("/api/node/act01/action", {"type": "limit", "unit": "x.service", "cpu_quota": 50,
-                                             "mem_max_mb": None, "cpu_weight": None})
+        self.call("pi:action", "act01", {"type": "limit", "unit": "x.service", "cpu_quota": 50, "mem_max_mb": None, "cpu_weight": None})
         reply = json.loads(self.link.request("POST", "/api/report", report("act01")))
         self.assertEqual(reply["actions"][0]["cpu_quota"], 50)
         self.assertNotIn("text", reply["actions"][0])

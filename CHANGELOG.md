@@ -2,6 +2,37 @@
 
 All notable changes to PiPulse. Format: [Keep a Changelog](https://keepachangelog.com).
 
+## [0.5.0] - 2026-09-25
+
+The dashboard is now a Bracket app: the same look, sign-in and security model as MediaLedger and
+Linewatch, and plain-English definitions for every term.
+
+### Added
+- **Bracket's look and layout**: the sidebar, stat tiles with coloured edges, cards, tables,
+  modals and the eight colour themes (Settings → Appearance), from the vendored Bracket kit 0.2.0
+  (`kit/`, upgraded with `node tools/kit-upgrade.js`).
+- **Pis page**: a row of tiles per Pi (health, CPU, memory, temperature, disk, link) that
+  refreshes every 5 seconds.
+- **Pi detail page**: laid out like Bracket's System page. Tiles for throttling, the filesystem,
+  disk writes, OS updates, network and processes, then Overview, History, Services, Processes and
+  Events tabs, with sortable, filterable tables and a Limit window.
+- **Definitions**: every Pi and PiPulse term (load average, swap, throttling, CPU cap, token,
+  archive, …) has a dotted underline. Hovering shows a one-line meaning, and clicking opens a panel
+  with the full explanation, what healthy looks like, what to do if it isn't, and related terms.
+- **Accounts**: admin and standard users, sessions per browser, sign-in lockout, LAN-only access,
+  optional guest view, an audit log, and the password asked again for reboot, shutdown, forgetting
+  a Pi, settings changes and hub updates. All on the new Security page.
+- **Home Assistant status URL** (Settings): read-only fleet JSON for REST sensors.
+- The hub installer offers to create the admin account. Otherwise the first visit to the
+  dashboard does.
+
+### Changed
+- PiPulse 0.4's dashboard password becomes the **admin** account, so sign in with the username
+  `admin` and the same password.
+- `pipulse-hub set-password` sets the admin password and restarts the hub.
+- The dashboard's API is the Bracket contract (`POST /api/<channel>`), served by `hub/web.py`, a
+  standard-library port of Bracket's Python adapter. The encrypted client link is unchanged.
+
 ## [0.4.2] - 2026-09-25
 
 ### Fixed
