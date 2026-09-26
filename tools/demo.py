@@ -10,6 +10,7 @@ token and certificate from hub/data, so run it next to a dev hub.
 """
 import json
 import math
+import os
 import random
 import sys
 import threading
@@ -24,10 +25,12 @@ import tls  # noqa: E402
 
 HUB = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-DATA = REPO / "hub" / "data"
+DATA = Path(os.environ.get("PIPULSE_DEMO_DATA", REPO / "hub" / "data"))  # a dev hub's --data folder
+LINK_PORT = int(os.environ.get("PIPULSE_DEMO_LINK_PORT", "8751"))
 TOKEN = json.loads(sqlite3.connect(DATA / "pipulse.db").execute("SELECT value FROM settings WHERE key = '_token'").fetchone()[0])
 PIN = tls.fingerprint(DATA / "hub-cert.pem")
 VERSION = (REPO / "VERSION").read_text().strip()
+NAMES = ["aether", "nova", "garage-zero"]  # hostnames, so screenshots read like a real home setup
 MODELS = [("Raspberry Pi 4 Model B Rev 1.5", 4, 4), ("Raspberry Pi 5 Model B Rev 1.0", 4, 8), ("Raspberry Pi Zero 2 W Rev 1.0", 4, 0.5)]
 SERVICES = ["medialedger.service", "pihole-FTL.service", "docker.service", "homebridge.service", "mosquitto.service",
             "ssh.service", "cron.service", "systemd-journald.service", "plexmediaserver.service"]
@@ -42,9 +45,9 @@ def fake(i):
     hog = list(units)[0]
     results, t0 = [], time.time()
     version = "0.2.0" if i == 1 else VERSION  # one outdated client, to exercise Update
-    link = client.Link(HUB, 8751, TOKEN, PIN)
+    link = client.Link(HUB, LINK_PORT, TOKEN, PIN)
     boot, booted, written, rtt, watch = f"boot-{i}-{t0}", t0 - 86400 * (i + 1), 3e9 * (i + 1), None, []
-    stopped, crashed = set(), False  # demo-pi-1 "crashes" its first watched service once
+    stopped, crashed = set(), False  # the first demo Pi "crashes" its first watched service once
     apt = {"upgradable": [0, 12, 3][i % 3], "security": [0, 2, 0][i % 3], "checked": time.time() - 3600,
            "reboot_required": i == 1, "job": None}
     apt_done_at = 0
@@ -52,7 +55,7 @@ def fake(i):
         t = time.time() - t0
         if apt["job"] == "running" and time.time() > apt_done_at:
             apt.update(job="done", upgradable=0, security=0, checked=time.time(), reboot_required=True)
-        # demo-pi-1's first watched service "crashes" 90 s after being watched, to exercise the watchdog.
+        # The first demo Pi's first watched service "crashes" 90 s after being watched, to exercise the watchdog.
         if i == 0 and watch and t > 90 and not crashed:
             stopped.add(watch[0])
             crashed = True
@@ -72,7 +75,7 @@ def fake(i):
                   "cpu": s["cpu"], "user": "root", "cmd": "/usr/bin/" + s["unit"].split(".")[0], "unit": s["unit"]}
                  for k, s in enumerate(svcs)]
         report = {
-            "id": f"demo{i:02d}", "hostname": f"demo-pi-{i + 1}", "ts": time.time(), "results": results,
+            "id": f"demo{i:02d}", "hostname": NAMES[i % len(NAMES)] + (str(i // len(NAMES) + 1) if i >= len(NAMES) else ""), "ts": time.time(), "results": results,
             "info": {"model": model, "os": "Debian GNU/Linux 13 (trixie)", "kernel": "6.12.47+rpt-rpi-v8",
                      "arch": "aarch64", "cores": cores, "cgroup2": True, "systemd": True, "client": version, "boot_id": boot},
             "apt": dict(apt), "watch": {u: ("failed" if u in stopped else "active") for u in watch},
@@ -98,7 +101,7 @@ def fake(i):
             rtt = round((time.monotonic() - t_req) * 1000 + random.uniform(0.5, 3), 1)
             watch = reply.get("watch") or []
         except Exception as e:
-            print(f"demo-pi-{i + 1}: {e}")
+            print(f"{NAMES[i % len(NAMES)]}: {e}")
             time.sleep(5)
             continue
         for a in reply.get("actions", []):

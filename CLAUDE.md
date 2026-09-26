@@ -58,6 +58,7 @@ python tools/demo.py [host] [count]     # fake Pis over the real pinned link
 python tools/demo.py --backfill         # 30 days of fake history (restart hub after)
 python -m unittest discover tests       # end-to-end: spawns a real hub on free ports
 python tools/package.py                 # dist/ release assets
+node tools/screenshots.js               # docs/screenshots from a running hub (headless Edge/Chrome; PIPULSE_SHOT_PASSWORD)
 ```
 
 ## Architecture
@@ -80,7 +81,7 @@ python tools/package.py                 # dist/ release assets
 | `kit/` | Bracket kit, vendored whole (0.2.0). Only `kit/renderer` + `kit/VERSION` ship in the hub tarball |
 | `client/client.py` | `Link` (pinned HTTPS), `Sampler`, `Apt`, `Watch`, actions, report loop, `--menu` (curses, with a numbered fallback) / `--check` / `--once` |
 | `client/install.sh`, `client/uninstall.sh` | Client installer (also `/usr/local/bin/pipulse`); the hub fills host, ports, token, pin and sha256 |
-| `tools/demo.py`, `tools/package.py` | Fake Pis (reboots, apt, watchdog crash) and backfill; release packaging |
+| `tools/demo.py`, `tools/package.py`, `tools/screenshots.js` | Fake Pis (reboots, apt, watchdog crash) and backfill; release packaging |
 | `tests/test_link.py`, `tests/test_features.py` | End-to-end tests with a real hub process, plus unit tests for NAS and guards |
 
 On a Pi: the hub is in `/opt/pipulse-hub/{hub,client,VERSION}` (same layout as
@@ -175,6 +176,10 @@ for any secrets.
 - **Shell heredocs mangle backslashes and quotes in patches** (Git Bash turned
   `\a` into a BEL character, and a Python heredoc with nested quotes wouldn't
   parse). Write patch scripts with the Write tool, as Linewatch learned too.
+- **Screenshots go on GitHub, so nothing secret may be in them.** `tools/screenshots.js` blanks
+  the install token to `<token>` before capturing. Run it against a throwaway hub: `subst N:` onto
+  a scratch folder gives tidy `N:\...` paths in Settings and About, and `PIPULSE_DEMO_DATA` /
+  `PIPULSE_DEMO_LINK_PORT` point the demo at that hub instead of `hub/data`.
 - **WSL is the test Pi.** Ubuntu there has systemd. WSL stops its VM between
   `wsl` calls when idle, so put a multi-step test in one script and run it with
   one `wsl ... sh script`. Use ports 8760/8761 for a WSL hub so they don't clash
