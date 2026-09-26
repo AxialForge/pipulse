@@ -2,6 +2,16 @@
 
 All notable changes to PiPulse. Format: [Keep a Changelog](https://keepachangelog.com).
 
+## [0.4.2] - 2026-09-25
+
+### Fixed
+- A NAS job that failed (for example because the share wasn't mounted yet on the
+  first start) counted as done, so the mirror and archive waited a full hour to try
+  again. Failed jobs now retry after 10 minutes.
+- The nightly backup ran only during its exact hour, so a hub that was off (or a NAS
+  that was asleep) then skipped the whole day. It now runs once a day any time from
+  that hour on, which also means a new install makes its first backup right away.
+
 ## [0.4.1] - 2026-09-25
 
 ### Fixed

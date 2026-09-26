@@ -90,6 +90,34 @@ class NasTest(unittest.TestCase):
         with tarfile.open(self.backups / kept[-1]) as t:
             self.assertEqual(sorted(t.getnames()), ["RESTORE.txt", "VERSION", "hub-cert.pem", "hub-key.pem", "pipulse.db"])
 
+    def test_failed_job_retries_in_ten_minutes(self):
+        started = []
+        self.nas.start = lambda job: started.append(job) or True
+        t = time.time()
+        # The 0.4.0 bug: the NAS wasn't mounted at first start, the mirror failed, and
+        # the failure counted as done for a full hour.
+        self.nas.status = {"archive": {"at": t, "ok": True, "msg": ""},
+                           "mirror": {"at": t, "ok": False, "msg": "not mounted"},
+                           "backup": {"at": t, "ok": True, "msg": "", "ok_at": t}}
+        self.nas.due(t + 300)
+        self.assertEqual(started, [])
+        self.nas.due(t + 601)
+        self.assertEqual(started, ["mirror"])
+
+    def test_backup_catches_up_after_its_hour(self):
+        started = []
+        self.nas.start = lambda job: started.append(job) or True
+        now = time.time()
+        hour = time.localtime(now).tm_hour
+        self.store.update_settings({"backup_hour": max(0, hour - 1), "mirror_hours": 0})
+        self.nas.status = {"archive": {"at": now, "ok": True, "msg": ""}}
+        self.nas.due(now)
+        self.assertEqual(started, ["backup"])  # never backed up today: run now, not tomorrow
+        self.nas.status["backup"] = {"at": now, "ok": True, "msg": "", "ok_at": now}
+        started.clear()
+        self.nas.due(now + 60)
+        self.assertEqual(started, [])  # once a day
+
     def test_refuses_missing_folder(self):
         ok, msg = check_dir(str(self.logs / "nope"))
         self.assertFalse(ok)

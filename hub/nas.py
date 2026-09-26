@@ -32,6 +32,7 @@ from pathlib import Path
 
 TABLES = (("samples", "raw_days"), ("hourly", "hourly_days"), ("events", "event_days"))
 BACKUP_PREFIX = "pipulse-backup-"
+RETRY = 600  # seconds before a failed NAS job is tried again
 RESTORE_TXT = """PiPulse Hub backup
 ==================
 Contains the hub database (settings, Pis, history, events), and the hub's TLS
@@ -83,7 +84,8 @@ class Nas:
 
     def _record(self, job, ok, msg, event_on_ok=None):
         prev = self.status.get(job, {})
-        self.status[job] = {"at": time.time(), "ok": ok, "msg": msg}
+        now = time.time()
+        self.status[job] = {"at": now, "ok": ok, "msg": msg, "ok_at": now if ok else prev.get("ok_at", 0)}
         self.store.put("_nas", self.status)
         names = {"mirror": "NAS mirror", "backup": "NAS backup", "archive": "NAS archive"}
         if not ok and (prev.get("ok", True) or prev.get("msg") != msg):
@@ -114,14 +116,24 @@ class Nas:
         """Called from the hub's upkeep loop; starts whatever is due. A slow or hung
         CIFS mount only ever blocks the worker thread, never the hub."""
         s = self.store.settings
-        last = lambda job: self.status.get(job, {}).get("at", 0)  # noqa: E731
-        if now - last("archive") >= 3600:
+
+        def due_at(job, every):
+            # A failed run (NAS not mounted yet, asleep, rebooting) retries in 10 minutes,
+            # not after the full interval. 0.4.0 waited the whole hour.
+            j = self.status.get(job)
+            return 0 if not j else j["at"] + (every if j["ok"] else min(every, RETRY))
+
+        if now >= due_at("archive", 3600):
             return self.start("archive")
-        if s["mirror_hours"] and s["nas_data_dir"] and now - last("mirror") >= s["mirror_hours"] * 3600:
+        if s["mirror_hours"] and s["nas_data_dir"] and now >= due_at("mirror", s["mirror_hours"] * 3600):
             return self.start("mirror")
+        # Nightly backup: once per day from backup_hour on, so a hub that was off (or a
+        # NAS that was asleep) at that hour still backs up later the same day.
         lt = time.localtime(now)
-        done_today = time.strftime("%Y-%m-%d", time.localtime(last("backup"))) == time.strftime("%Y-%m-%d", lt)
-        if s["nas_backup_dir"] and lt.tm_hour == s["backup_hour"] and not done_today:
+        b = self.status.get("backup", {})
+        done_today = time.strftime("%Y-%m-%d", time.localtime(b.get("ok_at", 0))) == time.strftime("%Y-%m-%d", lt)
+        if s["nas_backup_dir"] and lt.tm_hour >= s["backup_hour"] and not done_today \
+                and (b.get("ok", True) or now - b.get("at", 0) >= RETRY):
             return self.start("backup")
 
     # ------------------------------------------------------------ jobs

@@ -132,6 +132,11 @@ for any secrets.
   nas-setup.sh uses a plain `nofail` mount plus `pipulse-nas-remount.timer`, and
   restarts the hub (the sandbox only sees mounts that existed when it started).
   `ReadWritePaths=-/mnt/pipulse` has the `-` so a missing mount can't stop the hub.
+- **A failed NAS job must not count as done.** In 0.4.0 the first start (NAS not
+  mounted yet) recorded a failed mirror, and scheduling from that timestamp
+  postponed the next try by a whole hour. The log looked clean, because NAS
+  errors go to Events, not stdout. `Nas.due()` now retries failures after
+  `RETRY` (10 min), and the backup schedules off `ok_at` (the last success).
 - **`update.sh` runs from a copy in /run.** The upgrade replaces
   `/opt/pipulse-hub` while the script is running, and sh reads scripts
   incrementally.
